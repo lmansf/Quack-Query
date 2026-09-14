@@ -1,8 +1,8 @@
 import type { QueryError, QueryRequest, QueryResponse, TableProfile } from "../shared/types";
 import { cleanSql, isReadOnlySql } from "../shared/sql";
-import { ProviderError, type Provider } from "./providers/types";
-import { anthropic } from "./providers/anthropic";
-import { groq } from "./providers/groq";
+import { ProviderError, type Provider } from "./_providers/types";
+import { anthropic, DEFAULT_ANTHROPIC_MODEL } from "./_providers/anthropic";
+import { groq, DEFAULT_GROQ_MODEL } from "./_providers/groq";
 
 const MAX_QUESTION_LENGTH = 2000;
 
@@ -74,6 +74,28 @@ function validate(body: unknown): QueryRequest | string {
   return { profile: { ...profile, fileName: typeof profile.fileName === "string" ? profile.fileName : "upload" }, question: question.trim() };
 }
 
+/**
+ * GET /api/query — configuration check. Reports which provider and model the
+ * deployment would use without calling the model. Useful on Vercel to confirm
+ * environment variables reached the function.
+ */
+export async function GET(): Promise<Response> {
+  const selected = selectProvider();
+  const body =
+    typeof selected === "string"
+      ? { ok: false, error: selected }
+      : { ok: true, provider: selected.name, model: modelFor(selected.name) };
+  return new Response(JSON.stringify(body), {
+    status: typeof selected === "string" ? 500 : 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function modelFor(provider: string): string {
+  if (provider === "groq") return process.env.GROQ_MODEL || DEFAULT_GROQ_MODEL;
+  return process.env.ANTHROPIC_MODEL || DEFAULT_ANTHROPIC_MODEL;
+}
+
 export async function POST(request: Request): Promise<Response> {
   if (request.method !== "POST") return json(405, { error: "Method not allowed" });
 
@@ -87,7 +109,10 @@ export async function POST(request: Request): Promise<Response> {
   if (typeof input === "string") return json(400, { error: input });
 
   const selected = selectProvider();
-  if (typeof selected === "string") return json(500, { error: selected });
+  if (typeof selected === "string") {
+    console.error(`[query] ${selected}`);
+    return json(500, { error: selected });
+  }
 
   const systemPrompt = buildSystemPrompt(input.profile);
 
@@ -104,7 +129,11 @@ export async function POST(request: Request): Promise<Response> {
     if (!isReadOnlySql(sql)) return json(422, { error: "Model did not return a read-only query", sql });
     return json(200, { sql });
   } catch (error) {
-    if (error instanceof ProviderError) return json(error.status, { error: error.message });
+    if (error instanceof ProviderError) {
+      console.error(`[query] ${selected.name} provider error ${error.status}: ${error.message}`);
+      return json(error.status, { error: error.message });
+    }
+    console.error(`[query] ${selected.name} provider failed:`, error);
     const message = error instanceof Error ? error.message : "Unknown error";
     return json(500, { error: `${selected.name} provider failed: ${message}` });
   }

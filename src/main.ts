@@ -248,12 +248,15 @@ async function askClaude(profile: TableProfile, question: string): Promise<strin
   });
 
   if (!res.ok) {
-    let message = res.statusText || `Request failed (${res.status})`;
+    let message = `Request failed (${res.status}${res.statusText ? " " + res.statusText : ""})`;
+    const text = await res.text().catch(() => "");
     try {
-      const data = (await res.json()) as Partial<QueryError>;
+      const data = JSON.parse(text) as Partial<QueryError>;
       if (typeof data.error === "string" && data.error) message = data.error;
     } catch {
-      // Body was not JSON; keep the status text.
+      // Not JSON (e.g. a platform error page); show a trimmed excerpt so the cause is visible.
+      const excerpt = text.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 300);
+      if (excerpt) message += `: ${excerpt}`;
     }
     throw new Error(message);
   }
