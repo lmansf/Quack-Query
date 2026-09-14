@@ -8,12 +8,26 @@ Upload a CSV, Parquet, or JSON file, type a question, and Quack Query has Claude
 
 - **DuckDB Wasm in the browser.** The file is loaded into an in-memory DuckDB instance running as WebAssembly. All parsing and querying happens client-side.
 - **Automatic profile → system prompt.** After loading, the app computes a compact profile of the table (column names, DuckDB types, distinct/null counts, and the full value list for low-cardinality columns). That profile, plus your question, is all that is sent to the server.
-- **Serverless function returns SQL only.** `api/query.ts` calls the Claude API with the profile as context and returns one read-only SELECT statement. The browser checks it is read-only, runs it in DuckDB, and shows the result table.
+- **Serverless function returns SQL only.** `api/query.ts` sends the profile and question to an LLM and returns one read-only SELECT statement. The browser checks it is read-only, runs it in DuckDB, and shows the result table.
+
+## LLM providers
+
+The function supports two providers, selected with environment variables:
+
+| Variable | Purpose |
+| --- | --- |
+| `LLM_PROVIDER` | `groq` or `anthropic`. Optional: defaults to Groq when `GROQ_API_KEY` is set, otherwise Anthropic. |
+| `GROQ_API_KEY` | Groq API key. |
+| `GROQ_MODEL` | Optional Groq model override (default `llama-3.3-70b-versatile`). |
+| `ANTHROPIC_API_KEY` | Anthropic API key. |
+| `ANTHROPIC_MODEL` | Optional Anthropic model override (default `claude-opus-5`). |
+
+Providers live in `api/providers/`; adding another OpenAI-compatible host is a copy of `groq.ts` with a different base URL.
 
 ## Local development
 
 ```sh
-cp .env.example .env   # then put your Anthropic API key in .env
+cp .env.example .env   # then put your API key in .env
 npm install
 npm run dev
 ```
@@ -22,7 +36,7 @@ A small Vite plugin in `vite.config.ts` serves `api/*.ts` at `/api/*` during `np
 
 ## Deploy
 
-Deploy to [Vercel](https://vercel.com). It auto-detects the Vite app and the `api/` directory as serverless functions. Set the `ANTHROPIC_API_KEY` environment variable in the project settings.
+Deploy to [Vercel](https://vercel.com). It auto-detects the Vite app and the `api/` directory as serverless functions. In the project settings, add `GROQ_API_KEY` (and `LLM_PROVIDER=groq`), or `ANTHROPIC_API_KEY` for Anthropic.
 
 ## Supported formats
 

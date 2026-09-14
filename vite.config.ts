@@ -44,8 +44,8 @@ function pickHandler(mod: Record<string, unknown>, method: string): ApiHandler |
  * Vercel CLI. Only active in serve mode.
  */
 function localApi(mode: string): Plugin {
-  // Load ANTHROPIC_* from .env files once, so api/ modules can read process.env.
-  const env = loadEnv(mode, process.cwd(), "ANTHROPIC_");
+  // Load provider settings from .env files once, so api/ modules can read process.env.
+  const env = loadEnv(mode, process.cwd(), ["LLM_", "GROQ_", "ANTHROPIC_"]);
   for (const [key, value] of Object.entries(env)) {
     if (process.env[key] === undefined) process.env[key] = value;
   }

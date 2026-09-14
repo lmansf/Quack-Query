@@ -1,8 +1,28 @@
-import Anthropic from "@anthropic-ai/sdk";
 import type { QueryError, QueryRequest, QueryResponse, TableProfile } from "../shared/types";
 import { cleanSql, isReadOnlySql } from "../shared/sql";
+import { ProviderError, type Provider } from "./providers/types";
+import { anthropic } from "./providers/anthropic";
+import { groq } from "./providers/groq";
 
 const MAX_QUESTION_LENGTH = 2000;
+
+const PROVIDERS: Record<string, Provider> = { anthropic, groq };
+
+/**
+ * Picks the LLM provider. `LLM_PROVIDER` wins when set; otherwise use whichever
+ * provider has an API key configured (Groq first, then Anthropic).
+ */
+export function selectProvider(env: NodeJS.ProcessEnv = process.env): { name: string; provider: Provider } | string {
+  const requested = env.LLM_PROVIDER?.trim().toLowerCase();
+  if (requested) {
+    const provider = PROVIDERS[requested];
+    if (!provider) return `Unknown LLM_PROVIDER "${requested}". Supported: ${Object.keys(PROVIDERS).join(", ")}`;
+    return { name: requested, provider };
+  }
+  if (env.GROQ_API_KEY) return { name: "groq", provider: groq };
+  if (env.ANTHROPIC_API_KEY || env.ANTHROPIC_AUTH_TOKEN) return { name: "anthropic", provider: anthropic };
+  return "No LLM provider configured. Set GROQ_API_KEY or ANTHROPIC_API_KEY (and optionally LLM_PROVIDER).";
+}
 
 /** Builds the (cached) system prompt describing the single table. */
 export function buildSystemPrompt(profile: TableProfile): string {
@@ -35,7 +55,7 @@ export function buildSystemPrompt(profile: TableProfile): string {
   return lines.join("\n");
 }
 
-function json(status: number, body: QueryResponse | QueryError): Response {
+function json(status: number, body: QueryResponse | QueryError | (QueryError & { sql: string })): Response {
   return new Response(JSON.stringify(body), {
     status,
     headers: { "Content-Type": "application/json" },
@@ -66,60 +86,26 @@ export async function POST(request: Request): Promise<Response> {
   const input = validate(parsed);
   if (typeof input === "string") return json(400, { error: input });
 
+  const selected = selectProvider();
+  if (typeof selected === "string") return json(500, { error: selected });
+
   const systemPrompt = buildSystemPrompt(input.profile);
 
-  if (!process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_AUTH_TOKEN) {
-    return json(500, { error: "Server is missing a valid ANTHROPIC_API_KEY" });
-  }
-
   try {
-    // Created lazily (per request) so credential problems surface as JSON errors, not import-time crashes.
-    const client = new Anthropic();
-    // `fallbacks` is newer than the SDK's typings in v0.80.0, hence the narrow cast.
-    const params = {
-      model: "claude-opus-5",
-      max_tokens: 4096,
-      betas: ["server-side-fallback-2026-07-01"],
-      fallbacks: "default",
-      output_config: { effort: "medium" },
-      system: [{ type: "text", text: systemPrompt, cache_control: { type: "ephemeral" } }],
-      messages: [{ role: "user", content: input.question }],
-    } as Anthropic.Beta.Messages.MessageCreateParamsNonStreaming;
-    const response = await client.beta.messages.create(params);
+    const result = await selected.provider({ system: systemPrompt, question: input.question });
 
-    if (response.stop_reason === "refusal") {
-      const { stop_details } = response as { stop_details?: { explanation?: string | null } | null };
-      const explanation = stop_details?.explanation;
-      return json(422, { error: "The model declined this request" + (explanation ? ": " + explanation : "") });
-    }
-    if (response.stop_reason === "max_tokens") {
+    if (result.finishReason === "refusal") return json(422, { error: "The model declined this request" });
+    if (result.finishReason === "length") {
       return json(502, { error: "The model's response was cut off before it finished the query" });
     }
 
-    const raw = response.content
-      .filter((block): block is Anthropic.Beta.Messages.BetaTextBlock => block.type === "text")
-      .map((block) => block.text)
-      .join("");
-    const sql = cleanSql(raw);
+    const sql = cleanSql(result.text);
     if (sql.length === 0) return json(502, { error: "The model returned an empty response" });
-    if (!isReadOnlySql(sql)) {
-      return new Response(JSON.stringify({ error: "Model did not return a read-only query", sql }), {
-        status: 422,
-        headers: { "Content-Type": "application/json" },
-      });
-    }
+    if (!isReadOnlySql(sql)) return json(422, { error: "Model did not return a read-only query", sql });
     return json(200, { sql });
   } catch (error) {
-    if (error instanceof Anthropic.AuthenticationError) {
-      return json(500, { error: "Server is missing a valid ANTHROPIC_API_KEY" });
-    }
-    if (error instanceof Anthropic.RateLimitError) {
-      return json(429, { error: "Rate limited by the model provider; please retry shortly" });
-    }
-    if (error instanceof Anthropic.APIError) {
-      return json(502, { error: `Model provider error (${error.status ?? "unknown"}): ${error.message}` });
-    }
+    if (error instanceof ProviderError) return json(error.status, { error: error.message });
     const message = error instanceof Error ? error.message : "Unknown error";
-    return json(500, { error: message });
+    return json(500, { error: `${selected.name} provider failed: ${message}` });
   }
 }
