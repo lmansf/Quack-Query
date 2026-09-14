@@ -2,7 +2,7 @@
  * Groq provider (OpenAI-compatible chat completions API), using global fetch.
  * Env: GROQ_API_KEY (required), GROQ_MODEL, GROQ_BASE_URL.
  */
-import { ProviderError, type Provider, type ProviderResult } from "./types";
+import { ProviderError, type Provider, type ProviderResult } from "./types.js";
 
 export const DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile";
 const MISSING_KEY = "Server is missing a valid GROQ_API_KEY";

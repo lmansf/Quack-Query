@@ -1,5 +1,5 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { ProviderError, type Provider } from "./types";
+import { ProviderError, type Provider } from "./types.js";
 
 export const DEFAULT_ANTHROPIC_MODEL = "claude-opus-5";
 

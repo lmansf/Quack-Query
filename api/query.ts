@@ -1,8 +1,8 @@
-import type { QueryError, QueryRequest, QueryResponse, TableProfile } from "../shared/types";
-import { cleanSql, isReadOnlySql } from "../shared/sql";
-import { ProviderError, type Provider } from "./_providers/types";
-import { anthropic, DEFAULT_ANTHROPIC_MODEL } from "./_providers/anthropic";
-import { groq, DEFAULT_GROQ_MODEL } from "./_providers/groq";
+import type { QueryError, QueryRequest, QueryResponse, TableProfile } from "../shared/types.js";
+import { cleanSql, isReadOnlySql } from "../shared/sql.js";
+import { ProviderError, type Provider } from "./_providers/types.js";
+import { anthropic, DEFAULT_ANTHROPIC_MODEL } from "./_providers/anthropic.js";
+import { groq, DEFAULT_GROQ_MODEL } from "./_providers/groq.js";
 
 const MAX_QUESTION_LENGTH = 2000;
 
