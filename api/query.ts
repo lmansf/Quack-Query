@@ -8,29 +8,16 @@ import type {
   TableProfile,
 } from "../shared/types.js";
 import { cleanSql, isReadOnlySql } from "../shared/sql.js";
-import { ProviderError, type Provider } from "./_providers/types.js";
-import { anthropic, DEFAULT_ANTHROPIC_MODEL } from "./_providers/anthropic.js";
-import { groq, DEFAULT_GROQ_MODEL, listGroqModels } from "./_providers/groq.js";
+import { ProviderError } from "./_providers/types.js";
+import { DEFAULT_ANTHROPIC_MODEL } from "./_providers/anthropic.js";
+import { DEFAULT_GROQ_MODEL, listGroqModels } from "./_providers/groq.js";
+import { selectProvider } from "./_providers/select.js";
+import { jsonResponse } from "./_providers/http.js";
+
+// Re-exported so existing importers keep working after the move to _providers/select.ts.
+export { selectProvider };
 
 const MAX_QUESTION_LENGTH = 2000;
-
-const PROVIDERS: Record<string, Provider> = { anthropic, groq };
-
-/**
- * Picks the LLM provider. `LLM_PROVIDER` wins when set; otherwise use whichever
- * provider has an API key configured (Groq first, then Anthropic).
- */
-export function selectProvider(env: NodeJS.ProcessEnv = process.env): { name: string; provider: Provider } | string {
-  const requested = env.LLM_PROVIDER?.trim().toLowerCase();
-  if (requested) {
-    const provider = PROVIDERS[requested];
-    if (!provider) return `Unknown LLM_PROVIDER "${requested}". Supported: ${Object.keys(PROVIDERS).join(", ")}`;
-    return { name: requested, provider };
-  }
-  if (env.GROQ_API_KEY) return { name: "groq", provider: groq };
-  if (env.ANTHROPIC_API_KEY || env.ANTHROPIC_AUTH_TOKEN) return { name: "anthropic", provider: anthropic };
-  return "No LLM provider configured. Set GROQ_API_KEY or ANTHROPIC_API_KEY (and optionally LLM_PROVIDER).";
-}
 
 /** Overlap fraction at or above which a hint (with a unique side) is called a likely join key. */
 const LIKELY_JOIN_OVERLAP = 0.9;
@@ -126,10 +113,7 @@ export function buildSystemPrompt(dataset: DatasetProfile): string {
 }
 
 function json(status: number, body: QueryResponse | QueryError | (QueryError & { sql: string })): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { "Content-Type": "application/json" },
-  });
+  return jsonResponse(status, body);
 }
 
 function validate(body: unknown): QueryRequest | string {
@@ -179,7 +163,7 @@ export async function GET(request: Request): Promise<Response> {
       throw error;
     }
   }
-  return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+  return jsonResponse(200, body);
 }
 
 function modelFor(provider: string): string {

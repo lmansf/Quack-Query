@@ -557,7 +557,9 @@ export function formatValue(v: unknown): string {
   if (v === null || v === undefined) return 'NULL';
   if (typeof v === 'string') return v;
   if (typeof v === 'bigint') return v.toString();
-  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+  if (typeof v === 'boolean') return String(v);
+  // Strip binary floating-point noise (668.3399999999999 -> 668.34) while keeping 15 significant digits.
+  if (typeof v === 'number') return Number.isFinite(v) ? String(Number(v.toPrecision(15))) : String(v);
   if (v instanceof Date) return v.toISOString();
   if (v instanceof Uint8Array) {
     return Array.from(v, (b) => b.toString(16).padStart(2, '0')).join('');

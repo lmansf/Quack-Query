@@ -9,14 +9,19 @@ import {
   isReadOnlySql,
   type QueryResult,
 } from "./duck";
-import type {
-  ColumnProfile,
-  DatasetProfile,
-  QueryError,
-  QueryRequest,
-  QueryResponse,
-  RelationshipHint,
-  TableProfile,
+import {
+  ANSWER_MAX_CELL_CHARS,
+  ANSWER_MAX_COLUMNS,
+  ANSWER_MAX_ROWS,
+  type AnswerRequest,
+  type AnswerResponse,
+  type ColumnProfile,
+  type DatasetProfile,
+  type QueryError,
+  type QueryRequest,
+  type QueryResponse,
+  type RelationshipHint,
+  type TableProfile,
 } from "../shared/types";
 
 const ACCEPT = ".csv,.tsv,.txt,.parquet,.json,.jsonl,.ndjson";
@@ -64,6 +69,7 @@ interface Shell {
   output: HTMLElement;
   sql: HTMLDivElement;
   results: HTMLDivElement;
+  answer: HTMLDivElement;
 }
 
 function renderShell(root: HTMLElement): Shell {
@@ -113,7 +119,9 @@ function renderShell(root: HTMLElement): Shell {
 
   const sql = el("div", { className: "output-sql" });
   const results = el("div", { className: "output-results" });
-  const output = el("section", { className: "output" }, sql, results);
+  const answer = el("div", { className: "answer card" });
+  answer.hidden = true;
+  const output = el("section", { className: "output" }, sql, results, answer);
   output.hidden = true;
 
   const footer = el(
@@ -121,9 +129,9 @@ function renderShell(root: HTMLElement): Shell {
     {},
     el("p", {
       text:
-        "Files are processed locally with DuckDB Wasm. Only the schema profiles " +
-        "(column names, types, counts, ranges, low-cardinality values, and relationship hints) " +
-        "are sent to the model.",
+        "Files are processed locally with DuckDB Wasm. The model only receives the schema profiles " +
+        "(column names, types, counts, ranges, low-cardinality values, and relationship hints) and, " +
+        "for the written answer, the first 50 rows of each query result.",
     }),
   );
 
@@ -151,6 +159,7 @@ function renderShell(root: HTMLElement): Shell {
     output,
     sql,
     results,
+    answer,
   };
 }
 
@@ -324,6 +333,27 @@ function renderResults(container: HTMLElement, result: QueryResult): void {
   container.replaceChildren(el("div", { className: "card" }, el("div", { className: "table-wrap" }, table)));
 }
 
+/** Fills the answer card with a label plus either the answer text or a muted note. */
+function renderAnswer(container: HTMLDivElement, text: string, muted = false): void {
+  const body = el(muted ? "p" : "div", { className: muted ? "muted" : "answer-text", text });
+  container.replaceChildren(el("h2", { text: "Answer" }), body);
+  container.hidden = false;
+}
+
+function hideAnswer(container: HTMLDivElement): void {
+  clear(container);
+  container.hidden = true;
+}
+
+/** Trims a query result down to the prefix the answer endpoint accepts. */
+function buildAnswerRequest(question: string, sql: string, result: QueryResult): AnswerRequest {
+  const columns = result.columns.slice(0, ANSWER_MAX_COLUMNS);
+  const rows = result.rows
+    .slice(0, ANSWER_MAX_ROWS)
+    .map((row) => row.slice(0, columns.length).map((v) => formatValue(v).slice(0, ANSWER_MAX_CELL_CHARS)));
+  return { question, sql, columns, rows, rowCount: result.rowCount };
+}
+
 function showError(box: HTMLDivElement, message: string): void {
   box.textContent = message;
   box.hidden = false;
@@ -345,33 +375,50 @@ function modelErrorFrom(result: QueryResult): string | null {
 // API call
 // ---------------------------------------------------------------------------
 
-async function askClaude(dataset: DatasetProfile, question: string): Promise<string> {
-  const body: QueryRequest = { dataset, question };
-  const res = await fetch("/api/query", {
+/** Builds a user-facing message from a non-2xx API response (`{ error }` JSON or a platform error page). */
+async function errorFromResponse(res: Response): Promise<Error> {
+  let message = `Request failed (${res.status}${res.statusText ? " " + res.statusText : ""})`;
+  const text = await res.text().catch(() => "");
+  try {
+    const data = JSON.parse(text) as Partial<QueryError>;
+    if (typeof data.error === "string" && data.error) message = data.error;
+  } catch {
+    // Not JSON (e.g. a platform error page); show a trimmed excerpt so the cause is visible.
+    const excerpt = text.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 300);
+    if (excerpt) message += `: ${excerpt}`;
+  }
+  return new Error(message);
+}
+
+async function postJson(path: string, body: unknown): Promise<Response> {
+  const res = await fetch(path, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   });
+  if (!res.ok) throw await errorFromResponse(res);
+  return res;
+}
 
-  if (!res.ok) {
-    let message = `Request failed (${res.status}${res.statusText ? " " + res.statusText : ""})`;
-    const text = await res.text().catch(() => "");
-    try {
-      const data = JSON.parse(text) as Partial<QueryError>;
-      if (typeof data.error === "string" && data.error) message = data.error;
-    } catch {
-      // Not JSON (e.g. a platform error page); show a trimmed excerpt so the cause is visible.
-      const excerpt = text.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 300);
-      if (excerpt) message += `: ${excerpt}`;
-    }
-    throw new Error(message);
-  }
+async function askClaude(dataset: DatasetProfile, question: string): Promise<string> {
+  const body: QueryRequest = { dataset, question };
+  const res = await postJson("/api/query", body);
 
   const data = (await res.json()) as Partial<QueryResponse>;
   if (typeof data.sql !== "string" || !data.sql.trim()) {
     throw new Error("The server returned no SQL.");
   }
   return data.sql.trim();
+}
+
+async function askForAnswer(body: AnswerRequest): Promise<string> {
+  const res = await postJson("/api/answer", body);
+
+  const data = (await res.json()) as Partial<AnswerResponse>;
+  if (typeof data.answer !== "string" || !data.answer.trim()) {
+    throw new Error("The server returned no answer.");
+  }
+  return data.answer.trim();
 }
 
 // ---------------------------------------------------------------------------
@@ -401,6 +448,7 @@ function main(): void {
     hideError(ui.error);
     clear(ui.sql);
     clear(ui.results);
+    hideAnswer(ui.answer);
     ui.output.hidden = true;
   };
 
@@ -479,6 +527,18 @@ function main(): void {
     }
   };
 
+  /** Answer step: never throws; failures land as a muted note inside the answer card. */
+  const writeAnswer = async (question: string, sql: string, result: QueryResult): Promise<void> => {
+    setStatus("Writing answer…");
+    renderAnswer(ui.answer, "Thinking…", true);
+    try {
+      const answer = await askForAnswer(buildAnswerRequest(question, sql, result));
+      renderAnswer(ui.answer, answer);
+    } catch (err) {
+      renderAnswer(ui.answer, `Couldn't write an answer: ${errorMessage(err)}`, true);
+    }
+  };
+
   const handleQuestion = async (question: string): Promise<void> => {
     if (dataset.tables.length === 0 || busy) return;
     busy = true;
@@ -517,6 +577,7 @@ function main(): void {
         showError(ui.error, modelError);
       } else {
         renderResults(ui.results, result);
+        await writeAnswer(question, sql, result);
         setStatus("Done.");
       }
     } catch (err) {

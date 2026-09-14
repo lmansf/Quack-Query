@@ -203,6 +203,26 @@ button.secondary:hover:not(:disabled) { background: var(--accent-soft); }
 .output-sql,
 .output-results { min-width: 0; }
 
+/* Natural-language answer: full width under the SQL + results columns */
+.answer { grid-column: 1 / -1; }
+
+.answer > h2 {
+  margin: 0 0 8px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.answer-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.6;
+}
+
+.answer .muted { line-height: 1.6; }
+
 .sql-block { position: relative; }
 .sql-block button { position: absolute; top: 8px; right: 8px; }
 
