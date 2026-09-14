@@ -223,18 +223,103 @@ button.secondary:hover:not(:disabled) { background: var(--accent-soft); }
 
 .answer .muted { line-height: 1.6; }
 
-.sql-block { position: relative; }
-.sql-block button { position: absolute; top: 8px; right: 8px; }
+/* Editable SQL: action buttons row above the textarea */
+.sql-block { display: flex; flex-direction: column; gap: 8px; }
 
-pre.sql {
+.sql-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
+}
+
+.sql-actions button.run { padding: 4px 14px; font-size: 0.85rem; }
+
+textarea.sql {
+  display: block;
+  width: 100%;
+  min-height: 6em;
   margin: 0;
-  padding: 14px 100px 14px 16px;
+  padding: 14px 16px;
   background: var(--code-bg);
   border: 1px solid var(--border);
   border-radius: 10px;
+  color: var(--fg);
   font: 0.88rem/1.5 var(--mono);
   white-space: pre-wrap;
   word-break: break-word;
+  resize: vertical;
+  field-sizing: content;
+  overflow-y: auto;
+}
+
+textarea.sql:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* Query history */
+.history-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.history-header > h2 {
+  margin: 0;
+  font-size: 0.85rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.history-list { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 8px; }
+
+.history-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px 12px;
+  padding: 10px 12px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.history-main { flex: 1 1 260px; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+
+.history .q { font-weight: 600; overflow-wrap: anywhere; }
+
+.history code {
+  display: block;
+  font: 0.82rem/1.5 var(--mono);
+  color: var(--fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.history .meta { color: var(--muted); font-size: 0.82rem; }
+.history .meta .error-text { color: var(--error-fg); }
+
+.history-actions { display: flex; flex-shrink: 0; gap: 6px; }
+
+/* Small pill, same look as .badge */
+.tag {
+  display: inline-block;
+  padding: 0 6px;
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 0.7rem;
+  font-weight: 600;
+  line-height: 1.5;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  vertical-align: middle;
 }
 
 caption {

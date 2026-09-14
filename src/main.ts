@@ -26,6 +26,93 @@ import {
 
 const ACCEPT = ".csv,.tsv,.txt,.parquet,.json,.jsonl,.ndjson";
 const MAX_ROWS = 500;
+const HISTORY_KEY = "quack-query:history";
+const HISTORY_MAX = 50;
+const HISTORY_ERROR_CHARS = 80;
+
+// ---------------------------------------------------------------------------
+// Query history
+// ---------------------------------------------------------------------------
+
+interface HistoryEntry {
+  id: string;
+  at: number;
+  question: string;
+  sql: string;
+  source: "model" | "edited" | "history";
+  rowCount?: number;
+  error?: string;
+}
+
+type HistorySource = HistoryEntry["source"];
+
+function isHistorySource(v: unknown): v is HistorySource {
+  return v === "model" || v === "edited" || v === "history";
+}
+
+function isHistoryEntry(v: unknown): v is HistoryEntry {
+  if (typeof v !== "object" || v === null) return false;
+  const e = v as Record<string, unknown>;
+  return (
+    typeof e.id === "string" &&
+    typeof e.at === "number" &&
+    typeof e.question === "string" &&
+    typeof e.sql === "string" &&
+    isHistorySource(e.source) &&
+    (e.rowCount === undefined || typeof e.rowCount === "number") &&
+    (e.error === undefined || typeof e.error === "string")
+  );
+}
+
+/** Reads the persisted history; returns [] when storage is unavailable or the data is malformed. */
+function loadHistory(): HistoryEntry[] {
+  try {
+    const raw = localStorage.getItem(HISTORY_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(isHistoryEntry).slice(0, HISTORY_MAX);
+  } catch {
+    return [];
+  }
+}
+
+function saveHistory(entries: HistoryEntry[]): void {
+  try {
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(entries));
+  } catch {
+    // Storage unavailable or full: history stays in memory for this session only.
+  }
+}
+
+function newHistoryId(): string {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function sameOutcome(a: Omit<HistoryEntry, "id" | "at">, b: HistoryEntry): boolean {
+  return (
+    a.question === b.question &&
+    a.sql === b.sql &&
+    a.source === b.source &&
+    a.rowCount === b.rowCount &&
+    a.error === b.error
+  );
+}
+
+function pad2(n: number): string {
+  return n < 10 ? `0${n}` : String(n);
+}
+
+/** `HH:MM` for today, otherwise `YYYY-MM-DD HH:MM` (local time). */
+function formatHistoryTime(at: number): string {
+  const d = new Date(at);
+  const now = new Date();
+  const time = `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+  const sameDay =
+    d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() && d.getDate() === now.getDate();
+  if (sameDay) return time;
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${time}`;
+}
 
 // ---------------------------------------------------------------------------
 // Small DOM helpers
@@ -70,6 +157,7 @@ interface Shell {
   sql: HTMLDivElement;
   results: HTMLDivElement;
   answer: HTMLDivElement;
+  history: HTMLElement;
 }
 
 function renderShell(root: HTMLElement): Shell {
@@ -124,6 +212,9 @@ function renderShell(root: HTMLElement): Shell {
   const output = el("section", { className: "output" }, sql, results, answer);
   output.hidden = true;
 
+  const history = el("section", { className: "history" });
+  history.hidden = true;
+
   const footer = el(
     "footer",
     {},
@@ -143,6 +234,7 @@ function renderShell(root: HTMLElement): Shell {
     el("section", {}, form, status),
     error,
     output,
+    history,
     footer,
   );
 
@@ -160,6 +252,7 @@ function renderShell(root: HTMLElement): Shell {
     sql,
     results,
     answer,
+    history,
   };
 }
 
@@ -295,13 +388,39 @@ function renderRelationships(container: HTMLElement, dataset: DatasetProfile): v
   container.hidden = false;
 }
 
-function renderSql(container: HTMLElement, sql: string): void {
-  const pre = el("pre", { className: "sql", text: sql });
+interface SqlEditor {
+  textarea: HTMLTextAreaElement;
+  run: HTMLButtonElement;
+  copy: HTMLButtonElement;
+}
+
+/** Sizes the textarea to its content: `rows` from the line count (works while hidden), then scrollHeight. */
+function autoGrow(textarea: HTMLTextAreaElement): void {
+  const lines = textarea.value.split("\n").length;
+  textarea.rows = Math.max(3, lines);
+  textarea.style.height = "auto";
+  if (textarea.scrollHeight > 0) textarea.style.height = `${textarea.scrollHeight}px`;
+}
+
+/** Renders the editable SQL block (textarea + Copy SQL / Run buttons) and returns its controls. */
+function renderSql(container: HTMLElement, sql: string, onRun: (sql: string) => void): SqlEditor {
+  const textarea = el("textarea", { className: "sql" });
+  textarea.value = sql;
+  textarea.spellcheck = false;
+  textarea.setAttribute("aria-label", "SQL query");
+  textarea.addEventListener("input", () => autoGrow(textarea));
+  textarea.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      if (!run.disabled) onRun(textarea.value);
+    }
+  });
+
   const copy = el("button", { className: "secondary", text: "Copy SQL" });
   copy.type = "button";
   copy.addEventListener("click", () => {
     void navigator.clipboard
-      .writeText(sql)
+      .writeText(textarea.value)
       .then(() => {
         copy.textContent = "Copied";
         setTimeout(() => {
@@ -312,7 +431,76 @@ function renderSql(container: HTMLElement, sql: string): void {
         copy.textContent = "Copy failed";
       });
   });
-  container.replaceChildren(el("div", { className: "sql-block" }, pre, copy));
+
+  const run = el("button", { className: "run", text: "Run" });
+  run.type = "button";
+  run.addEventListener("click", () => onRun(textarea.value));
+
+  container.replaceChildren(
+    el("div", { className: "sql-block" }, el("div", { className: "sql-actions" }, copy, run), textarea),
+  );
+  autoGrow(textarea);
+  return { textarea, run, copy };
+}
+
+interface HistoryHandlers {
+  onLoad: (entry: HistoryEntry) => void;
+  onRemove: (entry: HistoryEntry) => void;
+  onClear: () => void;
+}
+
+function historyRow(entry: HistoryEntry, canLoad: boolean, handlers: HistoryHandlers): HTMLLIElement {
+  const meta = el("div", { className: "meta" }, el("span", { text: formatHistoryTime(entry.at) }));
+  if (entry.error !== undefined) {
+    meta.append(" · ", el("span", { className: "outcome error-text", text: `error: ${entry.error.slice(0, HISTORY_ERROR_CHARS)}` }));
+  } else if (entry.rowCount !== undefined) {
+    meta.append(" · ", el("span", { className: "outcome", text: `${entry.rowCount.toLocaleString()} ${entry.rowCount === 1 ? "row" : "rows"}` }));
+  }
+  if (entry.source === "edited") meta.append(" ", el("span", { className: "tag", text: "edited" }));
+
+  const load = el("button", { className: "secondary", text: "Load" });
+  load.type = "button";
+  load.disabled = !canLoad;
+  load.addEventListener("click", () => handlers.onLoad(entry));
+
+  const remove = el("button", { className: "secondary", text: "Remove" });
+  remove.type = "button";
+  remove.addEventListener("click", () => handlers.onRemove(entry));
+
+  return el(
+    "li",
+    { className: "history-row" },
+    el(
+      "div",
+      { className: "history-main" },
+      el("div", { className: "q", text: entry.question }),
+      el("code", { text: entry.sql.replace(/\s+/g, " ").trim(), title: entry.sql }),
+      meta,
+    ),
+    el("div", { className: "history-actions" }, load, remove),
+  );
+}
+
+function renderHistory(
+  container: HTMLElement,
+  entries: HistoryEntry[],
+  canLoad: boolean,
+  handlers: HistoryHandlers,
+): void {
+  clear(container);
+  if (entries.length === 0) {
+    container.hidden = true;
+    return;
+  }
+  const clearButton = el("button", { className: "secondary", text: "Clear history" });
+  clearButton.type = "button";
+  clearButton.addEventListener("click", handlers.onClear);
+  container.append(el("div", { className: "history-header" }, el("h2", { text: "History" }), clearButton));
+
+  const list = el("ul", { className: "history-list" });
+  for (const entry of entries) list.append(historyRow(entry, canLoad, handlers));
+  container.append(list);
+  container.hidden = false;
 }
 
 function renderResults(container: HTMLElement, result: QueryResult): void {
@@ -433,20 +621,52 @@ function main(): void {
   let dataset: DatasetProfile = { tables: [], hints: [] };
   let dbReady = false;
   let busy = false;
+  let lastQuestion = "";
+  let editor: SqlEditor | null = null;
+  let history: HistoryEntry[] = loadHistory();
 
   const setStatus = (text: string): void => {
     ui.status.textContent = text;
+  };
+
+  const historyHandlers: HistoryHandlers = {
+    onLoad: (entry) => void handleHistoryLoad(entry),
+    onRemove: (entry) => {
+      history = history.filter((e) => e.id !== entry.id);
+      saveHistory(history);
+      refreshHistory();
+    },
+    onClear: () => {
+      history = [];
+      saveHistory(history);
+      refreshHistory();
+    },
+  };
+
+  const refreshHistory = (): void => {
+    renderHistory(ui.history, history, dbReady && !busy, historyHandlers);
+  };
+
+  const recordHistory = (entry: Omit<HistoryEntry, "id" | "at">): void => {
+    const newest = history[0];
+    if (newest && sameOutcome(entry, newest)) return;
+    history = [{ id: newHistoryId(), at: Date.now(), ...entry }, ...history].slice(0, HISTORY_MAX);
+    saveHistory(history);
+    refreshHistory();
   };
 
   const updateFormState = (): void => {
     const enabled = dbReady && dataset.tables.length > 0 && !busy;
     ui.questionInput.disabled = !enabled;
     ui.askButton.disabled = !enabled;
+    if (editor) editor.run.disabled = busy || !dbReady;
+    refreshHistory();
   };
 
   const resetOutput = (): void => {
     hideError(ui.error);
     clear(ui.sql);
+    editor = null;
     clear(ui.results);
     hideAnswer(ui.answer);
     ui.output.hidden = true;
@@ -454,7 +674,18 @@ function main(): void {
 
   const showOutput = (): void => {
     ui.output.hidden = false;
+    if (editor) autoGrow(editor.textarea);
   };
+
+  /** Puts SQL into the editor (creating it if needed) and shows the output section. */
+  const showSql = (sql: string): void => {
+    editor = renderSql(ui.sql, sql, (text) => void handleRun(text));
+    editor.run.disabled = busy || !dbReady;
+    showOutput();
+  };
+
+  /** The question the answer step is written against: the last one asked, else what's typed now. */
+  const currentQuestion = (): string => lastQuestion || ui.questionInput.value.trim() || "What does this query return?";
 
   const renderDataset = (): void => {
     renderTables(ui.tables, dataset.tables, (table) => void handleRemove(table));
@@ -539,11 +770,51 @@ function main(): void {
     }
   };
 
+  /**
+   * Runs SQL that is already in the editor: renders results, applies the model-error
+   * convention, writes the answer, and records the outcome in history. Shared by the
+   * Ask flow, the editor's Run button, and history replay.
+   */
+  const executeSql = async (question: string, sql: string, source: HistorySource): Promise<void> => {
+    if (busy) return;
+    busy = true;
+    updateFormState();
+    hideError(ui.error);
+    clear(ui.results);
+    hideAnswer(ui.answer);
+    showOutput();
+
+    try {
+      setStatus("Running query…");
+      const result = await runQuery(sql, MAX_ROWS);
+      const modelError = modelErrorFrom(result);
+      if (modelError !== null) {
+        setStatus("");
+        showError(ui.error, modelError);
+        recordHistory({ question, sql, source, error: modelError });
+      } else {
+        renderResults(ui.results, result);
+        recordHistory({ question, sql, source, rowCount: result.rowCount });
+        await writeAnswer(question, sql, result);
+        setStatus("Done.");
+      }
+    } catch (err) {
+      const message = `Query failed: ${errorMessage(err)}`;
+      setStatus("");
+      showError(ui.error, message);
+      recordHistory({ question, sql, source, error: message });
+    } finally {
+      busy = false;
+      updateFormState();
+    }
+  };
+
   const handleQuestion = async (question: string): Promise<void> => {
     if (dataset.tables.length === 0 || busy) return;
     busy = true;
     updateFormState();
     resetOutput();
+    lastQuestion = question;
 
     let sql: string;
     try {
@@ -557,8 +828,8 @@ function main(): void {
       return;
     }
 
-    renderSql(ui.sql, sql);
-    showOutput();
+    // Always show the SQL, even when it can't be run, so the user can correct it in the editor.
+    showSql(sql);
 
     if (!isReadOnlySql(sql)) {
       setStatus("");
@@ -568,25 +839,37 @@ function main(): void {
       return;
     }
 
-    try {
-      setStatus("Running query…");
-      const result = await runQuery(sql, MAX_ROWS);
-      const modelError = modelErrorFrom(result);
-      if (modelError !== null) {
-        setStatus("");
-        showError(ui.error, modelError);
-      } else {
-        renderResults(ui.results, result);
-        await writeAnswer(question, sql, result);
-        setStatus("Done.");
-      }
-    } catch (err) {
+    busy = false;
+    await executeSql(question, sql, "model");
+  };
+
+  /** Run button / Ctrl+Enter: executes whatever is in the editor, keeping the text as typed. */
+  const handleRun = async (text: string): Promise<void> => {
+    if (busy || !dbReady) return;
+    const sql = text.trim();
+    if (!sql) return;
+    if (!isReadOnlySql(sql)) {
       setStatus("");
-      showError(ui.error, `Query failed: ${errorMessage(err)}`);
-    } finally {
-      busy = false;
-      updateFormState();
+      showError(ui.error, "Only read-only SELECT statements can be run.");
+      return;
     }
+    await executeSql(currentQuestion(), sql, "edited");
+  };
+
+  /** History "Load": restores question + SQL and replays the query without calling the model. */
+  const handleHistoryLoad = async (entry: HistoryEntry): Promise<void> => {
+    if (busy || !dbReady) return;
+    ui.questionInput.value = entry.question;
+    lastQuestion = entry.question;
+    hideError(ui.error);
+    clear(ui.results);
+    hideAnswer(ui.answer);
+    showSql(entry.sql);
+    if (dataset.tables.length === 0) {
+      setStatus("Load a file, then press Run.");
+      return;
+    }
+    await executeSql(entry.question, entry.sql, "history");
   };
 
   // --- wiring ---------------------------------------------------------------
@@ -625,6 +908,7 @@ function main(): void {
 
   // --- boot -----------------------------------------------------------------
 
+  refreshHistory();
   setStatus("Starting DuckDB…");
   initDuckDB()
     .then(() => {
