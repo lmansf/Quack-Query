@@ -22,7 +22,9 @@ The function supports two providers, selected with environment variables:
 | `ANTHROPIC_API_KEY` | Anthropic API key. |
 | `ANTHROPIC_MODEL` | Optional Anthropic model override (default `claude-opus-5`). |
 
-Providers live in `api/providers/`; adding another OpenAI-compatible host is a copy of `groq.ts` with a different base URL.
+Providers live in `api/_providers/` (the underscore keeps Vercel from deploying them as separate functions); adding another OpenAI-compatible host is a copy of `groq.ts` with a different base URL.
+
+Note for editing `api/`: the package is an ES module, and Vercel runs the compiled function natively with Node, so relative imports there must carry a `.js` extension (for example `import { x } from "../shared/sql.js"`). Without it the function crashes at load time with `FUNCTION_INVOCATION_FAILED`. You can reproduce Vercel's build locally with `npx vercel build` and inspect `.vercel/output/functions/api/query.func`.
 
 ## Local development
 
