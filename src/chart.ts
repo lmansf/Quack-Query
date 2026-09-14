@@ -29,13 +29,9 @@ const SURFACE = 'var(--card, #ffffff)';
 const NUM_RE = /^\s*[-+]?(\d+\.?\d*|\.\d+)(e[-+]?\d+)?\s*$/i;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?$/;
 const CSS = `.chart-svg{display:block;width:100%;height:auto;font-family:inherit;font-size:11px;overflow:visible}
-.chart-svg text{font-variant-numeric:tabular-nums}
-.chart-svg .mark{transition:opacity .12s}
-.chart-svg.hovering .mark:not(.hover){opacity:.6}
-.chart-svg:focus,.chart-svg .hit{outline:none}
+.chart-svg text{font-variant-numeric:tabular-nums}.chart-svg .mark{transition:opacity .12s}
+.chart-svg.hovering .mark:not(.hover){opacity:.6}.chart-svg:focus,.chart-svg .hit{outline:none}
 .chart-svg .hit:focus-visible{stroke:${ACCENT};stroke-width:2}`;
-
-// --- Spec: which column is x, which is y, bar or line ----------------------
 
 const isNull = (v: unknown): boolean => v === null || v === undefined;
 
@@ -50,11 +46,7 @@ function stringify(v: unknown): string {
   if (isNull(v)) return 'NULL';
   if (v instanceof Date) return v.toISOString();
   if (typeof v !== 'object') return String(v);
-  try {
-    return JSON.stringify(v, (_k, x: unknown) => (typeof x === 'bigint' ? x.toString() : x));
-  } catch {
-    return String(v);
-  }
+  try { return JSON.stringify(v, (_k, x: unknown) => (typeof x === 'bigint' ? x.toString() : x)); } catch { return String(v); }
 }
 
 /** Column shape from its non-null cells: ISO dates, numbers, or anything else. */
@@ -87,8 +79,6 @@ export function chartSpec(result: QueryResult): ChartSpec | null {
   return { kind, xLabel: columns[xi], yLabel: columns[yi], points, horizontal: !isLine && points.length > 12, dropped };
 }
 
-// --- Numbers, ticks, geometry helpers ---------------------------------------
-
 /** Thousands separators, up to 2 decimals; k/M/B suffixes when `compact`. */
 export function formatNumber(v: number, compact = true): string {
   if (!Number.isFinite(v)) return String(v);
@@ -112,7 +102,7 @@ function niceTicks(lo: number, hi: number): { ticks: number[]; step: number } {
   const step = p * (m >= 7.07 ? 10 : m >= 3.16 ? 5 : m >= 1.41 ? 2 : 1);
   const start = Math.floor(lo / step) * step;
   const ticks: number[] = [];
-  for (let i = 0; start + i * step <= hi + step / 2; i++) ticks.push(Number((start + i * step).toPrecision(12)));
+  for (let i = 0; !ticks.length || ticks[ticks.length - 1] < hi; i++) ticks.push(Number((start + i * step).toPrecision(12)));
   return { ticks, step };
 }
 
@@ -155,8 +145,6 @@ function text(parent: Node, x: number, y: number, s: string, anchor: string, fil
   return el(parent, 'text', { x, y, fill, 'text-anchor': anchor, 'dominant-baseline': baseline }, s);
 }
 
-// --- Tooltip and hover wiring ---------------------------------------------
-
 interface Tip { node: HTMLElement; show(p: ChartPoint, clientX: number, clientY: number): void; hide(): void }
 
 function makeTip(root: HTMLElement, spec: ChartSpec): Tip {
@@ -193,23 +181,13 @@ function makeTip(root: HTMLElement, spec: ChartSpec): Tip {
 
 /** Per-bar hover and keyboard focus: highlight the mark, show the tooltip. */
 function bindBar(svg: SVGSVGElement, hit: SVGRectElement, mark: SVGPathElement, p: ChartPoint, tip: Tip): void {
-  const on = (cx: number, cy: number): void => {
-    svg.classList.add('hovering');
-    mark.classList.add('hover');
-    tip.show(p, cx, cy);
-  };
-  const off = (): void => {
-    svg.classList.remove('hovering');
-    mark.classList.remove('hover');
-    tip.hide();
-  };
+  const on = (cx: number, cy: number): void => { svg.classList.add('hovering'); mark.classList.add('hover'); tip.show(p, cx, cy); };
+  const off = (): void => { svg.classList.remove('hovering'); mark.classList.remove('hover'); tip.hide(); };
   hit.addEventListener('pointermove', (e) => on(e.clientX, e.clientY));
   hit.addEventListener('pointerleave', off);
   hit.addEventListener('focus', () => { const r = mark.getBoundingClientRect(); on(r.left + r.width / 2, r.top); });
   hit.addEventListener('blur', off);
 }
-
-// --- Rendering -------------------------------------------------------------
 
 /** A `div.chart` holding the SVG and its tooltip layer; redrawn at the container's pixel width. */
 export function renderChart(spec: ChartSpec): HTMLElement {
@@ -219,14 +197,13 @@ export function renderChart(spec: ChartSpec): HTMLElement {
   const tip = makeTip(root, spec);
   root.appendChild(tip.node);
   let svg: SVGSVGElement | null = null;
+  const kind = spec.kind === 'bar' ? 'Bar' : 'Line';
   const build = (width: number): void => {
     tip.hide();
-    const next = document.createElementNS(NS, 'svg');
-    next.setAttribute('class', 'chart-svg');
-    next.setAttribute('width', '100%');
-    next.setAttribute('role', 'img');
-    const kind = spec.kind === 'bar' ? 'Bar' : 'Line';
-    next.setAttribute('aria-label', `${kind} chart of ${spec.yLabel} by ${spec.xLabel}, ${spec.points.length} points`);
+    const next = el(root, 'svg', {
+      class: 'chart-svg', width: '100%', role: 'img',
+      'aria-label': `${kind} chart of ${spec.yLabel} by ${spec.xLabel}, ${spec.points.length} points`,
+    });
     el(next, 'style', {}, CSS);
     if (spec.horizontal) drawHorizontal(spec, next, tip, width);
     else drawVertical(spec, next, tip, width);
@@ -281,22 +258,32 @@ function drawVertical(spec: ChartSpec, svg: SVGSVGElement, tip: Tip, W: number):
   text(svg, 0, 12, spec.yLabel, 'start', MUTED);
   text(svg, left + pw / 2, H - 6, spec.xLabel, 'middle', MUTED);
 
-  // X labels: every category for bars; for lines, thin to non-colliding dates keeping first and last.
+  // X labels: every category for bars. For lines, keep the first and last dates and spread as
+  // many evenly between them as fit without touching, snapped to the nearest point.
   const maxChars = Math.floor((rotate ? 120 : isBar ? band - 6 : 200) / CHAR_W);
   const box = (i: number): [number, number, string] => {
     const [x, w] = [cx(i), truncate(labels[i], maxChars).length * CHAR_W];
     if (x - w / 2 < 2) return [x, x + w, 'start'];
     return x + w / 2 > W - 2 ? [x - w, x, 'end'] : [x - w / 2, x + w / 2, 'middle'];
   };
-  const k = isBar ? 1 : Math.ceil((Math.min(widest(labels), 200) + 8) / band);
-  const shown: number[] = [];
-  for (let i = 0; i < n; i = i + k < n ? i + k : n - 1 > i ? n - 1 : n) {
-    let ok = true;
-    while (!rotate && shown.length && box(i)[0] < box(shown[shown.length - 1])[1] + 8) {
+  const shown: number[] = isBar ? labels.map((_, i) => i) : [0];
+  const push = (i: number): void => {
+    while (shown.length && box(i)[0] < box(shown[shown.length - 1])[1] + 8) {
       if (i === n - 1) shown.pop();
-      else { ok = false; break; }
+      else return;
     }
-    if (ok) shown.push(i);
+    shown.push(i);
+  };
+  if (!isBar) {
+    const w = Math.min(widest(labels), maxChars * CHAR_W);
+    const [e0, s1] = [box(0)[1], box(n - 1)[0]];
+    const m = Math.max(0, Math.floor((s1 - e0 - 10) / (w + 10)));
+    const slack = s1 - e0 - 10 - m * (w + 10);
+    for (let j = 1; j <= m; j++) {
+      const c = e0 + 10 + (j - 1) * (w + 10) + (j * slack) / (m + 1) + w / 2;
+      push(Math.max(1, Math.min(n - 2, Math.round((c - left) / band - 0.5))));
+    }
+    push(n - 1);
   }
   const ax = top + ph;
   for (const i of shown) {
@@ -345,17 +332,12 @@ function drawVertical(spec: ChartSpec, svg: SVGSVGElement, tip: Tip, W: number):
     cur = Math.max(0, Math.min(n - 1, i));
     const [x, y] = px[cur];
     for (const [g, attrs] of [[cross, { x1: x, x2: x }], [dot, { cx: x, cy: y }]] as const) {
-      for (const [a, v] of Object.entries(attrs)) g.setAttribute(a, String(r2(v)));
-      g.setAttribute('visibility', 'visible');
+      for (const [a, v] of Object.entries({ ...attrs, visibility: 'visible' })) g.setAttribute(a, typeof v === 'number' ? String(r2(v)) : v);
     }
     const r = svg.getBoundingClientRect();
     tip.show(points[cur], e ? e.clientX : r.left + (x * r.width) / W, e ? e.clientY : r.top + (y * r.height) / H);
   };
-  const hide = (): void => {
-    cur = -1;
-    for (const g of [cross, dot]) g.setAttribute('visibility', 'hidden');
-    tip.hide();
-  };
+  const hide = (): void => { cur = -1; for (const g of [cross, dot]) g.setAttribute('visibility', 'hidden'); tip.hide(); };
   svg.setAttribute('tabindex', '0');
   svg.addEventListener('pointermove', (e) => {
     const r = svg.getBoundingClientRect();
@@ -365,7 +347,7 @@ function drawVertical(spec: ChartSpec, svg: SVGSVGElement, tip: Tip, W: number):
   svg.addEventListener('focus', () => show(n - 1));
   svg.addEventListener('blur', hide);
   svg.addEventListener('keydown', (e) => {
-    const d = e.key === 'ArrowLeft' ? -1 : e.key === 'ArrowRight' ? 1 : 0;
+    const d = ({ ArrowLeft: -1, ArrowRight: 1 } as Record<string, number>)[e.key] ?? 0;
     if (d) { e.preventDefault(); show(cur + d); }
   });
 }
