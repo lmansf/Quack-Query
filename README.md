@@ -18,7 +18,7 @@ The function supports two providers, selected with environment variables:
 | --- | --- |
 | `LLM_PROVIDER` | `groq` or `anthropic`. Optional: defaults to Groq when `GROQ_API_KEY` is set, otherwise Anthropic. |
 | `GROQ_API_KEY` | Groq API key. |
-| `GROQ_MODEL` | Optional Groq model override (default `llama-3.3-70b-versatile`). |
+| `GROQ_MODEL` | Optional Groq model override (default `openai/gpt-oss-120b`). Groq retires models regularly; `GET /api/query?models=1` lists the IDs your key can currently use. |
 | `ANTHROPIC_API_KEY` | Anthropic API key. |
 | `ANTHROPIC_MODEL` | Optional Anthropic model override (default `claude-opus-5`). |
 

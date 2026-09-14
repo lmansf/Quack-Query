@@ -2,7 +2,7 @@ import type { QueryError, QueryRequest, QueryResponse, TableProfile } from "../s
 import { cleanSql, isReadOnlySql } from "../shared/sql.js";
 import { ProviderError, type Provider } from "./_providers/types.js";
 import { anthropic, DEFAULT_ANTHROPIC_MODEL } from "./_providers/anthropic.js";
-import { groq, DEFAULT_GROQ_MODEL } from "./_providers/groq.js";
+import { groq, DEFAULT_GROQ_MODEL, listGroqModels } from "./_providers/groq.js";
 
 const MAX_QUESTION_LENGTH = 2000;
 
@@ -79,16 +79,22 @@ function validate(body: unknown): QueryRequest | string {
  * deployment would use without calling the model. Useful on Vercel to confirm
  * environment variables reached the function.
  */
-export async function GET(): Promise<Response> {
+export async function GET(request: Request): Promise<Response> {
   const selected = selectProvider();
-  const body =
-    typeof selected === "string"
-      ? { ok: false, error: selected }
-      : { ok: true, provider: selected.name, model: modelFor(selected.name) };
-  return new Response(JSON.stringify(body), {
-    status: typeof selected === "string" ? 500 : 200,
-    headers: { "Content-Type": "application/json" },
-  });
+  if (typeof selected === "string") return json(500, { error: selected });
+
+  const body: Record<string, unknown> = { ok: true, provider: selected.name, model: modelFor(selected.name) };
+  if (new URL(request.url).searchParams.has("models")) {
+    // Ask the provider which models this key can use. Only Groq supports it here.
+    if (selected.name !== "groq") return json(400, { error: "Model listing is only available for the groq provider" });
+    try {
+      body.models = await listGroqModels();
+    } catch (error) {
+      if (error instanceof ProviderError) return json(error.status, { error: error.message });
+      throw error;
+    }
+  }
+  return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
 }
 
 function modelFor(provider: string): string {

@@ -4,8 +4,46 @@
  */
 import { ProviderError, type Provider, type ProviderResult } from "./types.js";
 
-export const DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile";
+/**
+ * Groq retires models on a schedule (llama-3.3-70b-versatile shut down in
+ * August 2026). Override with GROQ_MODEL; `listGroqModels` shows what a key
+ * can use right now.
+ */
+export const DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b";
 const MISSING_KEY = "Server is missing a valid GROQ_API_KEY";
+const MODEL_HINT = "Set GROQ_MODEL to a model your key can use; GET /api/query?models=1 lists them.";
+
+function groqBaseUrl(): string {
+  return (process.env.GROQ_BASE_URL ?? "https://api.groq.com/openai/v1").replace(/\/+$/, "");
+}
+
+/** Model IDs the configured key can access, sorted. */
+export async function listGroqModels(): Promise<string[]> {
+  const apiKey = process.env.GROQ_API_KEY;
+  if (!apiKey) throw new ProviderError(500, MISSING_KEY);
+  let res: Response;
+  try {
+    res = await fetch(`${groqBaseUrl()}/models`, { headers: { Authorization: `Bearer ${apiKey}` } });
+  } catch (err) {
+    throw new ProviderError(502, `Could not reach Groq: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  const raw = await res.text();
+  if (!res.ok) {
+    if (res.status === 401 || res.status === 403) throw new ProviderError(500, MISSING_KEY);
+    throw new ProviderError(502, `Groq error (${res.status}): ${errorMessage(raw)}`);
+  }
+  let json: unknown;
+  try {
+    json = JSON.parse(raw);
+  } catch {
+    throw new ProviderError(502, "Groq returned a non-JSON response");
+  }
+  const data = isRecord(json) && Array.isArray(json.data) ? json.data : [];
+  return data
+    .map((m) => (isRecord(m) && typeof m.id === "string" ? m.id : null))
+    .filter((id): id is string => id !== null)
+    .sort();
+}
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -53,11 +91,10 @@ export const groq: Provider = async (input) => {
   if (!apiKey) throw new ProviderError(500, MISSING_KEY);
 
   const model = process.env.GROQ_MODEL || DEFAULT_GROQ_MODEL;
-  const baseUrl = (process.env.GROQ_BASE_URL ?? "https://api.groq.com/openai/v1").replace(/\/+$/, "");
 
   let res: Response;
   try {
-    res = await fetch(`${baseUrl}/chat/completions`, {
+    res = await fetch(`${groqBaseUrl()}/chat/completions`, {
       method: "POST",
       headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -82,7 +119,10 @@ export const groq: Provider = async (input) => {
     const { status } = res;
     if (status === 401 || status === 403) throw new ProviderError(500, MISSING_KEY);
     if (status === 429) throw new ProviderError(429, "Rate limited by Groq; please retry shortly");
-    if ([400, 404, 413, 422].includes(status)) {
+    if (status === 404 || /model/i.test(message)) {
+      throw new ProviderError(502, `Groq rejected the request (${status}): ${message.replace(/\.+$/, "")}. ${MODEL_HINT}`);
+    }
+    if ([400, 413, 422].includes(status)) {
       throw new ProviderError(502, `Groq rejected the request (${status}): ${message}`);
     }
     throw new ProviderError(502, `Groq error (${status}): ${message}`);
