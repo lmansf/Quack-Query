@@ -171,8 +171,12 @@ function formatBytes(n: number): string {
 interface Shell {
   dropzone: HTMLDivElement;
   fileInput: HTMLInputElement;
-  tables: HTMLElement;
-  relationships: HTMLElement;
+  addFiles: HTMLButtonElement;
+  /** Secondary "Data" section: table cards, relationships, and the model view. */
+  data: HTMLElement;
+  tables: HTMLDivElement;
+  relationships: HTMLDetailsElement;
+  modelView: HTMLDetailsElement;
   form: HTMLFormElement;
   questionInput: HTMLInputElement;
   askButton: HTMLButtonElement;
@@ -184,6 +188,12 @@ interface Shell {
   answer: HTMLDivElement;
   history: HTMLElement;
   answerToggle: HTMLInputElement;
+  /**
+   * Orders the page for one of its two states. Nodes are moved, never recreated, so
+   * listeners survive. With tables: ask (primary) → error → output → data (secondary)
+   * → history. Without: the big dropzone → error → output (for history replays) → history.
+   */
+  arrange: (hasTables: boolean) => void;
 }
 
 function renderShell(root: HTMLElement): Shell {
@@ -209,12 +219,28 @@ function renderShell(root: HTMLElement): Shell {
   );
   dropzone.tabIndex = 0;
 
-  const tables = el("section", { className: "tables" });
-  tables.hidden = true;
+  const status = el("div", { className: "status" });
+  const upload = el("section", { className: "upload" }, dropzone, status);
 
-  const relationships = el("section", { className: "relationships" });
+  // --- secondary: data ------------------------------------------------------
+  const addFiles = el("button", { className: "secondary", text: "Add files" });
+  addFiles.type = "button";
+  addFiles.disabled = true;
+  const tables = el("div", { className: "tables" });
+  const relationships = el("details", { className: "relationships" });
   relationships.hidden = true;
+  const modelView = el("details", { className: "model-view" });
+  const data = el(
+    "section",
+    { className: "data" },
+    el("div", { className: "data-header" }, el("h2", { text: "Data" }), addFiles),
+    tables,
+    relationships,
+    modelView,
+  );
+  data.hidden = true;
 
+  // --- primary: ask ---------------------------------------------------------
   const questionInput = el("input");
   questionInput.type = "text";
   questionInput.placeholder = "e.g. Total revenue by customer region, joining orders to customers";
@@ -238,7 +264,18 @@ function renderShell(root: HTMLElement): Shell {
     " Write a plain-language answer (sends the first 50 result rows to the model)",
   );
 
-  const status = el("div", { className: "status" });
+  const ask = el(
+    "section",
+    { className: "ask" },
+    el("p", {
+      className: "hint",
+      text: "Ask in plain language. The model writes one SQL query; you can edit it before re-running.",
+    }),
+    form,
+    answerOption,
+  );
+  ask.hidden = true;
+
   const error = el("div", { className: "error" });
   error.hidden = true;
 
@@ -263,23 +300,29 @@ function renderShell(root: HTMLElement): Shell {
     }),
   );
 
-  root.replaceChildren(
-    header,
-    el("section", {}, dropzone),
-    tables,
-    relationships,
-    el("section", {}, form, answerOption, status),
-    error,
-    output,
-    history,
-    footer,
-  );
+  const arrange = (hasTables: boolean): void => {
+    upload.hidden = hasTables;
+    ask.hidden = !hasTables;
+    data.hidden = !hasTables;
+    if (hasTables) {
+      ask.append(status);
+      root.append(header, upload, ask, error, output, data, history, footer);
+    } else {
+      upload.append(status);
+      root.append(header, upload, ask, error, output, history, data, footer);
+    }
+  };
+
+  arrange(false);
 
   return {
     dropzone,
     fileInput,
+    addFiles,
+    data,
     tables,
     relationships,
+    modelView,
     form,
     questionInput,
     askButton,
@@ -291,6 +334,7 @@ function renderShell(root: HTMLElement): Shell {
     answer,
     history,
     answerToggle,
+    arrange,
   };
 }
 
@@ -317,24 +361,22 @@ function saveAnswerPreference(enabled: boolean): void {
 // Rendering pieces
 // ---------------------------------------------------------------------------
 
+/**
+ * One collapsed card per table. `openTables` remembers which cards the user expanded so
+ * a re-render (after adding or removing a file) keeps them open.
+ */
 function renderTables(
   container: HTMLElement,
   dataset: DatasetProfile,
+  openTables: Set<string>,
   onRemove: (table: string) => void,
 ): void {
   clear(container);
-  if (dataset.tables.length === 0) {
-    container.hidden = true;
-    return;
-  }
-  container.append(el("h2", { text: "Tables" }));
-  for (const profile of dataset.tables) container.append(tableCard(profile, onRemove));
-  container.append(modelViewPanel(dataset));
-  container.hidden = false;
+  for (const profile of dataset.tables) container.append(tableCard(profile, openTables, onRemove));
 }
 
-/** Collapsible panel showing the exact system prompt the model receives for this dataset. */
-function modelViewPanel(dataset: DatasetProfile): HTMLDetailsElement {
+/** Fills the collapsible panel showing the exact system prompt the model receives for this dataset. */
+function renderModelView(container: HTMLDetailsElement, dataset: DatasetProfile): void {
   const text = describeModelView(dataset);
   const pre = el("pre", { text });
   const copy = el("button", { className: "secondary", text: "Copy prompt" });
@@ -352,20 +394,26 @@ function modelViewPanel(dataset: DatasetProfile): HTMLDetailsElement {
         copy.textContent = "Copy failed";
       });
   });
-  return el(
-    "details",
-    { className: "model-view" },
+  container.replaceChildren(
     el("summary", { text: "What the model sees" }),
-    el("p", {
-      className: "muted",
-      text: "This is the exact system prompt sent with every question. Row data is never included.",
-    }),
-    pre,
-    el("div", { className: "model-view-actions" }, copy),
+    el(
+      "div",
+      { className: "details-body" },
+      el("p", {
+        className: "muted",
+        text: "This is the exact system prompt sent with every question. Row data is never included.",
+      }),
+      pre,
+      el("div", { className: "model-view-actions" }, copy),
+    ),
   );
 }
 
-function tableCard(profile: TableProfile, onRemove: (table: string) => void): HTMLDivElement {
+function tableCard(
+  profile: TableProfile,
+  openTables: Set<string>,
+  onRemove: (table: string) => void,
+): HTMLDetailsElement {
   const table = el("table");
   const thead = el("thead");
   thead.append(
@@ -381,27 +429,34 @@ function tableCard(profile: TableProfile, onRemove: (table: string) => void): HT
 
   const remove = el("button", { className: "secondary", text: "Remove" });
   remove.type = "button";
-  remove.addEventListener("click", () => onRemove(profile.table));
+  remove.addEventListener("click", (e) => {
+    // A click inside <summary> would also toggle the card.
+    e.preventDefault();
+    e.stopPropagation();
+    onRemove(profile.table);
+  });
 
-  return el(
-    "div",
-    { className: "card" },
+  const card = el(
+    "details",
+    { className: "card table-card" },
     el(
-      "div",
-      { className: "card-header" },
-      el(
-        "div",
-        {},
-        el("h3", { text: profile.fileName }),
-        el("div", {
-          className: "meta",
-          text: `Table ${profile.table} · ${profile.rowCount.toLocaleString()} rows · ${profile.columns.length} columns`,
-        }),
-      ),
+      "summary",
+      {},
+      el("span", { className: "name", text: profile.fileName }),
+      el("span", {
+        className: "meta",
+        text: `Table ${profile.table} · ${profile.rowCount.toLocaleString()} rows · ${profile.columns.length} columns`,
+      }),
       remove,
     ),
-    el("div", { className: "table-wrap" }, table),
+    el("div", { className: "details-body" }, el("div", { className: "table-wrap" }, table)),
   );
+  card.open = openTables.has(profile.table);
+  card.addEventListener("toggle", () => {
+    if (card.open) openTables.add(profile.table);
+    else openTables.delete(profile.table);
+  });
+  return card;
 }
 
 function profileRow(col: ColumnProfile): HTMLTableRowElement {
@@ -451,15 +506,21 @@ function hintDetails(hint: RelationshipHint): string {
   return parts.join(" · ");
 }
 
-function renderRelationships(container: HTMLElement, dataset: DatasetProfile): void {
+/** Collapsed "Relationships" panel; only shown with two or more tables. Keeps its open state. */
+function renderRelationships(container: HTMLDetailsElement, dataset: DatasetProfile): void {
   clear(container);
   if (dataset.tables.length < 2) {
     container.hidden = true;
     return;
   }
-  container.append(el("h2", { text: "Relationships" }));
-  if (dataset.hints.length === 0) {
-    container.append(el("p", { className: "muted", text: "No likely join keys detected." }));
+  const n = dataset.hints.length;
+  const summaryText =
+    n === 0 ? "Relationships · none detected" : `Relationships · ${n} possible join ${n === 1 ? "key" : "keys"}`;
+  container.append(el("summary", { text: summaryText }));
+  const body = el("div", { className: "details-body" });
+  container.append(body);
+  if (n === 0) {
+    body.append(el("p", { className: "muted", text: "No likely join keys detected." }));
   } else {
     const list = el("ul", { className: "hints" });
     for (const hint of dataset.hints) {
@@ -474,7 +535,7 @@ function renderRelationships(container: HTMLElement, dataset: DatasetProfile): v
       if (details) item.append(el("span", { className: "details", text: details }));
       list.append(item);
     }
-    container.append(list);
+    body.append(list);
   }
   container.hidden = false;
 }
@@ -763,6 +824,10 @@ function main(): void {
   let lastRun: { sql: string; rowCount: number } | null = null;
   let editor: SqlEditor | null = null;
   let history: HistoryEntry[] = loadHistory();
+  /** Table cards the user has expanded; survives re-renders of the data section. */
+  const openTables = new Set<string>();
+  /** Which of the two page layouts is currently applied (null until the first `layout()`). */
+  let layoutHasTables: boolean | null = null;
 
   const setStatus = (text: string): void => {
     ui.status.textContent = text;
@@ -798,8 +863,17 @@ function main(): void {
     const enabled = dbReady && dataset.tables.length > 0 && !busy;
     ui.questionInput.disabled = !enabled;
     ui.askButton.disabled = !enabled;
+    ui.addFiles.disabled = !dbReady || busy;
     if (editor) editor.run.disabled = busy || !dbReady;
     refreshHistory();
+  };
+
+  /** Switches between the "no tables" (dropzone-first) and "tables loaded" (ask-first) layouts. */
+  const layout = (): void => {
+    const hasTables = dataset.tables.length > 0;
+    if (hasTables === layoutHasTables) return;
+    layoutHasTables = hasTables;
+    ui.arrange(hasTables);
   };
 
   const resetOutput = (): void => {
@@ -827,8 +901,13 @@ function main(): void {
   const currentQuestion = (): string => lastQuestion || ui.questionInput.value.trim() || "What does this query return?";
 
   const renderDataset = (): void => {
-    renderTables(ui.tables, dataset, (table) => void handleRemove(table));
+    for (const name of openTables) {
+      if (!dataset.tables.some((t) => t.table === name)) openTables.delete(name);
+    }
+    renderTables(ui.tables, dataset, openTables, (table) => void handleRemove(table));
     renderRelationships(ui.relationships, dataset);
+    renderModelView(ui.modelView, dataset);
+    layout();
     updateFormState();
   };
 
@@ -864,7 +943,7 @@ function main(): void {
     if (failures.length > 0) showError(ui.error, failures.join("\n"));
     if (loaded > 0) {
       const count = dataset.tables.length;
-      setStatus(`Loaded ${loaded} ${loaded === 1 ? "file" : "files"}. ${count} ${count === 1 ? "table" : "tables"} ready. Ask a question below.`);
+      setStatus(`Loaded ${loaded} ${loaded === 1 ? "file" : "files"}. ${count} ${count === 1 ? "table" : "tables"} ready. Ask a question.`);
     } else {
       setStatus("");
     }
@@ -1095,17 +1174,28 @@ function main(): void {
     ui.fileInput.value = "";
   });
 
-  ui.dropzone.addEventListener("dragover", (e) => {
-    e.preventDefault();
-    ui.dropzone.classList.add("dragover");
-  });
-  ui.dropzone.addEventListener("dragleave", () => ui.dropzone.classList.remove("dragover"));
-  ui.dropzone.addEventListener("drop", (e) => {
-    e.preventDefault();
-    ui.dropzone.classList.remove("dragover");
-    const files = Array.from(e.dataTransfer?.files ?? []);
-    if (files.length > 0) void handleFiles(files);
-  });
+  ui.addFiles.addEventListener("click", () => ui.fileInput.click());
+
+  /** Makes `target` accept dropped files, outlining it with `.dragover` while a drag hovers. */
+  const attachDropTarget = (target: HTMLElement): void => {
+    target.addEventListener("dragover", (e) => {
+      e.preventDefault();
+      target.classList.add("dragover");
+    });
+    target.addEventListener("dragleave", (e) => {
+      // Moving between the target's own children also fires dragleave; keep the outline then.
+      if (e.relatedTarget instanceof Node && target.contains(e.relatedTarget)) return;
+      target.classList.remove("dragover");
+    });
+    target.addEventListener("drop", (e) => {
+      e.preventDefault();
+      target.classList.remove("dragover");
+      const files = Array.from(e.dataTransfer?.files ?? []);
+      if (files.length > 0) void handleFiles(files);
+    });
+  };
+  attachDropTarget(ui.dropzone);
+  attachDropTarget(ui.data);
 
   ui.form.addEventListener("submit", (e) => {
     e.preventDefault();
@@ -1115,6 +1205,7 @@ function main(): void {
 
   // --- boot -----------------------------------------------------------------
 
+  layout();
   refreshHistory();
   setStatus("Starting DuckDB…");
   initDuckDB()

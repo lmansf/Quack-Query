@@ -320,7 +320,7 @@ async function profileTable(table: string, fileName: string): Promise<TableProfi
       );
       const values = vectorValues(res, 0).map(formatValue);
       // Personal data stays in the browser: the model learns the column exists, not its contents.
-      if (looksSensitive(name, values)) col.valuesWithheld = true;
+      if (looksSensitive(name, types[i], values)) col.valuesWithheld = true;
       else col.values = values;
     }
     columns.push(col);
@@ -341,9 +341,11 @@ const PHONE_RE = /^\+?[\d\s().-]{7,}$/;
  * the column name suggests PII or secrets, or when most values look like
  * email addresses or phone numbers.
  */
-export function looksSensitive(name: string, values: string[]): boolean {
+export function looksSensitive(name: string, type: string, values: string[]): boolean {
   const n = name.trim();
   if (SENSITIVE_NAME_RE.test(n) || PERSON_NAME_RE.test(n)) return true;
+  // Emails and phone numbers are text; dates and numeric ids must not trip the phone pattern.
+  if (typeFamily(type) !== 'varchar') return false;
   const nonEmpty = values.filter((v) => v.trim() !== '');
   if (nonEmpty.length === 0) return false;
   const emails = nonEmpty.filter((v) => EMAIL_RE.test(v)).length;

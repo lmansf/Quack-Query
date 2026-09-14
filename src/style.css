@@ -35,7 +35,11 @@ header p { margin: 0; color: var(--muted); }
 
 section { margin-bottom: 20px; }
 
-section > h2 {
+/* Section headings: small uppercase, muted */
+section > h2,
+.data-header > h2,
+.history-header > h2,
+.answer > h2 {
   margin: 0 0 10px;
   font-size: 0.85rem;
   font-weight: 600;
@@ -67,21 +71,114 @@ section > h2 {
   padding: 14px 16px;
 }
 
-/* Tables section: vertical stack of table cards */
-.tables { display: flex; flex-direction: column; gap: 12px; }
-.tables > h2 { margin-bottom: 0; }
+/* ---------------------------------------------------------------------------
+   Primary: the Ask section
+   --------------------------------------------------------------------------- */
+.ask {
+  padding: 18px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
 
-.card-header {
+.ask .hint { margin: 0 0 10px; color: var(--muted); font-size: 0.9rem; }
+
+.ask .question input {
+  padding: 14px 16px;
+  font-size: 1.1rem;
+  border-radius: 10px;
+}
+
+.ask .question button[type="submit"] {
+  padding: 14px 24px;
+  font-size: 1.05rem;
+  border-radius: 10px;
+}
+
+.ask label.option { margin-top: 12px; }
+.ask .status { margin: 10px 0 0; }
+
+/* ---------------------------------------------------------------------------
+   Secondary: the Data section (table cards, relationships, model view)
+   --------------------------------------------------------------------------- */
+.data { border-radius: 10px; }
+.data.dragover { outline: 2px dashed var(--accent); outline-offset: 8px; }
+
+.data-header {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
   gap: 12px;
   margin-bottom: 10px;
 }
 
-.card-header > div { min-width: 0; }
-.card h3 { margin: 0 0 2px; font-size: 1.05rem; font-weight: 600; overflow-wrap: anywhere; }
-.card .meta { color: var(--muted); font-size: 0.9rem; }
+.data-header > h2 { margin: 0; }
+
+/* Vertical stack of collapsible table cards */
+.tables { display: flex; flex-direction: column; gap: 10px; }
+
+/* Collapsible panels share a caret in place of the default disclosure marker */
+.table-card > summary,
+.relationships > summary,
+.model-view > summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
+  list-style: none;
+  cursor: pointer;
+  user-select: none;
+}
+
+.table-card > summary::-webkit-details-marker,
+.relationships > summary::-webkit-details-marker,
+.model-view > summary::-webkit-details-marker { display: none; }
+
+.table-card > summary::before,
+.relationships > summary::before,
+.model-view > summary::before {
+  content: "▸";
+  flex-shrink: 0;
+  width: 1em;
+  color: var(--muted);
+  font-size: 0.9em;
+  line-height: 1;
+  text-align: center;
+  transition: transform 120ms ease;
+}
+
+.table-card[open] > summary::before,
+.relationships[open] > summary::before,
+.model-view[open] > summary::before { transform: rotate(90deg); }
+
+.table-card { padding: 0; }
+
+.table-card > summary {
+  padding: 10px 16px;
+  border-radius: 10px;
+  transition: background 0.15s;
+}
+
+.table-card > summary:hover { background: var(--accent-soft); }
+.table-card[open] > summary { border-radius: 10px 10px 0 0; border-bottom: 1px solid var(--border); }
+
+.table-card .name { font-weight: 600; overflow-wrap: anywhere; }
+.table-card .meta { flex: 1 1 auto; min-width: 0; color: var(--muted); font-size: 0.9rem; }
+.table-card > summary > button { margin-left: auto; }
+.table-card > .details-body { padding: 12px 16px 14px; }
+
+/* Lighter rows under the cards; padding-left lines their carets up with the cards' */
+.relationships > summary {
+  padding: 6px 16px;
+  border-radius: 8px;
+  color: var(--muted);
+  font-size: 0.9rem;
+  font-weight: 600;
+  transition: background 0.15s;
+}
+
+.relationships > summary:hover { background: var(--accent-soft); }
+.relationships > .details-body { padding: 8px 16px 4px 40px; }
 
 /* "key" marker for unique columns */
 .badge {
@@ -246,14 +343,17 @@ label.option input { margin: 0; accent-color: var(--accent); }
 .chart-note { margin: 6px 0 0; color: var(--muted); font-size: 0.8rem; }
 
 /* "What the model sees": the exact system prompt, collapsible */
-.model-view { margin-top: 12px; }
-.model-view summary {
-  cursor: pointer;
+.model-view { margin-top: 4px; }
+.model-view > summary {
+  padding: 6px 16px;
+  border-radius: 8px;
   color: var(--accent);
   font-size: 0.9rem;
   font-weight: 600;
-  user-select: none;
+  transition: background 0.15s;
 }
+.model-view > summary:hover { background: var(--accent-soft); }
+.model-view > .details-body { padding: 8px 16px 4px 40px; }
 .model-view pre {
   margin: 8px 0 0;
   padding: 12px 14px;
@@ -271,14 +371,7 @@ label.option input { margin: 0; accent-color: var(--accent); }
 /* Natural-language answer: full width under the SQL + results columns */
 .answer { grid-column: 1 / -1; }
 
-.answer > h2 {
-  margin: 0 0 8px;
-  font-size: 0.85rem;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  color: var(--muted);
-}
+.answer > h2 { margin-bottom: 8px; }
 
 .answer-text {
   white-space: pre-wrap;
@@ -330,14 +423,7 @@ textarea.sql:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
   margin-bottom: 10px;
 }
 
-.history-header > h2 {
-  margin: 0;
-  font-size: 0.85rem;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  color: var(--muted);
-}
+.history-header > h2 { margin: 0; }
 
 .history-list { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 8px; }
 
@@ -415,4 +501,6 @@ footer { margin-top: 32px; color: var(--muted); font-size: 0.85rem; }
 
 @media (max-width: 480px) {
   .question { flex-direction: column; }
+  .ask { padding: 14px; }
+  .table-card > summary > button { margin-left: 0; }
 }
