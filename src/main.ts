@@ -1,4 +1,5 @@
 import "./style.css";
+import { inject } from "@vercel/analytics";
 import {
   initDuckDB,
   addFile,
@@ -29,6 +30,9 @@ import {
   type RelationshipHint,
   type TableProfile,
 } from "../shared/types";
+
+// Initialize Vercel Web Analytics
+inject();
 
 const ACCEPT = ".csv,.tsv,.txt,.parquet,.json,.jsonl,.ndjson";
 const MAX_ROWS = 500;
