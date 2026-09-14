@@ -552,6 +552,92 @@ export async function runQuery(sql: string, maxRows = 500): Promise<QueryResult>
   return { columns, rows, rowCount, truncated: rowCount > limit };
 }
 
+// ---------------------------------------------------------------------------
+// Export
+// ---------------------------------------------------------------------------
+
+/** File formats `exportQuery` can produce. */
+export type ExportFormat = 'csv' | 'parquet';
+
+/** Monotonic suffix that keeps concurrent export temp files distinct. */
+let exportCounter = 0;
+
+/**
+ * Runs an (already validated, read-only) query and returns its full result
+ * serialized as a file. The query is wrapped in DuckDB's `COPY (...) TO`,
+ * written to a temp file in DuckDB-Wasm's in-memory virtual filesystem, read
+ * back as bytes, and the temp file is removed again.
+ *
+ * - `csv`: RFC-4180-style CSV (comma separator, `"` quoting with doubled
+ *   embedded quotes, `\n` line endings) with a header row. NULLs are written
+ *   as empty fields, dates as `YYYY-MM-DD`.
+ * - `parquet`: a standard Parquet file (default DuckDB compression).
+ *
+ * A single trailing `;` on the user SQL is stripped, since a `COPY` subquery
+ * cannot end with one. Any DuckDB error propagates to the caller.
+ */
+export async function exportQuery(sql: string, format: ExportFormat): Promise<Uint8Array> {
+  const db = await getDb();
+  const conn = await getConn();
+  const inner = subqueryText(sql);
+  const name = `export_${Date.now()}_${exportCounter++}.${format}`;
+  const options = format === 'csv' ? 'FORMAT CSV, HEADER true' : 'FORMAT PARQUET';
+  try {
+    // Pre-register the target as an in-memory buffer file (DuckDB-Wasm's documented
+    // COPY-to-buffer pattern); the COPY below then writes into the virtual FS.
+    await db.registerEmptyFileBuffer(name);
+    await conn.query(`COPY (${inner}) TO ${quoteLiteral(name)} (${options})`);
+    return await db.copyFileToBuffer(name);
+  } finally {
+    await db.dropFile(name).catch(() => null);
+  }
+}
+
+/** Trims a statement and strips a single trailing `;` so it can be used as a subquery. */
+function subqueryText(sql: string): string {
+  return sql.trim().replace(/;$/, '');
+}
+
+/**
+ * Exact number of rows a read-only statement produces, computed inside DuckDB
+ * (`SELECT count(*) FROM (<sql>)`) so the result is never materialized here.
+ * Throws for statements DuckDB will not accept as a subquery (SHOW, PRAGMA...).
+ */
+export async function countQuery(sql: string): Promise<number> {
+  const conn = await getConn();
+  const res = await conn.query(`SELECT count(*) AS n FROM (${subqueryText(sql)}) AS q`);
+  return Number(res.getChildAt(0)?.get(0) ?? 0);
+}
+
+/**
+ * Like `runQuery`, but fetches only the first `maxRows` rows (`... LIMIT maxRows + 1`)
+ * and gets the exact `rowCount` from a separate `countQuery`, so large results
+ * never have to be materialized in the browser. Pass `knownRowCount` (from an
+ * earlier `countQuery(sql)`) to skip the count. Statements DuckDB rejects as a
+ * subquery (SHOW, DESCRIBE, PRAGMA...) fall back to a plain `runQuery`.
+ */
+export async function runQueryPreview(
+  sql: string,
+  maxRows = 500,
+  knownRowCount?: number,
+): Promise<QueryResult> {
+  const inner = subqueryText(sql);
+  let preview: QueryResult;
+  let rowCount: number;
+  try {
+    preview = await runQuery(`SELECT * FROM (${inner}) AS q LIMIT ${maxRows + 1}`, maxRows + 1);
+    rowCount = knownRowCount ?? (await countQuery(inner));
+  } catch {
+    return runQuery(sql, maxRows);
+  }
+  return {
+    columns: preview.columns,
+    rows: preview.rows.slice(0, maxRows),
+    rowCount,
+    truncated: rowCount > maxRows,
+  };
+}
+
 /** Human-readable string for any cell value (used for profiles and display). */
 export function formatValue(v: unknown): string {
   if (v === null || v === undefined) return 'NULL';

@@ -11,6 +11,11 @@ Upload one or more CSV, Parquet, or JSON files, type a question, and Quack Query
 - **Relationship hints.** With two or more tables, the app looks for join keys: columns that share a name across tables, and column pairs whose values actually overlap (measured with a DuckDB join on distinct values). Numeric and date pairs are only considered when a column name looks like a key (`id`, `customer_id`, `sku`, …) or references the other table, so quantities and prices are not mistaken for ids. The hints are shown in the UI and included in the prompt, with the strongest ones marked as likely join keys.
 - **Serverless function returns SQL only.** `api/query.ts` sends the profiles, hints, and question to an LLM and returns one read-only SELECT statement, joins allowed. The browser checks it is read-only, runs it in DuckDB, and shows the query beside the results.
 - **Answer step.** After the results render, the browser sends the question, the SQL, and the first 50 result rows to `api/answer.ts`, which asks the same LLM provider for a short plain-language answer grounded in those rows. It appears under the query output. Only the (truncated) result rows are sent, never the source files.
+- **Editable SQL and history.** The generated SQL sits in an editor with Run (Ctrl/Cmd+Enter) and Copy. Every run is recorded in a History panel (question, SQL, row count or error), persisted in the browser's localStorage, and can be replayed without calling the model.
+- **Safe previews.** Results are counted first and only the first 500 rows are fetched for display, so large results are never materialized in the browser. Results over 100,000 rows ask for confirmation before the preview runs. The exact row count is always shown.
+- **Quick chart.** When a result has two columns and one is numeric, a Chart toggle draws a bar chart (or a line chart when the other column holds dates) as inline SVG with hover values.
+- **Export.** Export CSV / Export Parquet write the full result of the current query through DuckDB's `COPY` and download it. Exports over 1,000,000 rows ask for confirmation.
+- **What the model sees.** Each dataset shows a collapsible panel with the exact system prompt the model receives, built from the same shared code the server uses.
 
 ## LLM providers
 

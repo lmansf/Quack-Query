@@ -203,6 +203,60 @@ button.secondary:hover:not(:disabled) { background: var(--accent-soft); }
 .output-sql,
 .output-results { min-width: 0; }
 
+/* Results card: caption + view toggle + export actions */
+.results-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+  margin-bottom: 8px;
+}
+
+.results-header .caption { color: var(--muted); font-size: 0.9rem; }
+.results-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.results-actions button.active { background: var(--accent-soft); border-color: var(--accent); }
+
+/* Quick chart */
+.chart { position: relative; width: 100%; }
+.chart svg { display: block; width: 100%; height: auto; font-family: inherit; }
+.chart .chart-tooltip {
+  position: absolute;
+  pointer-events: none;
+  background: var(--fg);
+  color: var(--bg);
+  padding: 4px 8px;
+  border-radius: 6px;
+  font-size: 0.8rem;
+  white-space: nowrap;
+  z-index: 2;
+}
+.chart .chart-tooltip[hidden] { display: none; }
+.chart-note { margin: 6px 0 0; color: var(--muted); font-size: 0.8rem; }
+
+/* "What the model sees": the exact system prompt, collapsible */
+.model-view { margin-top: 12px; }
+.model-view summary {
+  cursor: pointer;
+  color: var(--accent);
+  font-size: 0.9rem;
+  font-weight: 600;
+  user-select: none;
+}
+.model-view pre {
+  margin: 8px 0 0;
+  padding: 12px 14px;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font: 0.8rem/1.5 var(--mono);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 50vh;
+  overflow: auto;
+}
+.model-view .model-view-actions { display: flex; gap: 8px; margin-top: 8px; }
+
 /* Natural-language answer: full width under the SQL + results columns */
 .answer { grid-column: 1 / -1; }
 

@@ -4,11 +4,17 @@ import {
   addFile,
   removeTable,
   buildDataset,
-  runQuery,
+  countQuery,
+  runQueryPreview,
+  exportQuery,
   formatValue,
   isReadOnlySql,
+  type ExportFormat,
   type QueryResult,
 } from "./duck";
+import { chartSpec, renderChart } from "./chart";
+import { downloadBytes, exportFileName } from "./download";
+import { describeModelView } from "../shared/prompt";
 import {
   ANSWER_MAX_CELL_CHARS,
   ANSWER_MAX_COLUMNS,
@@ -26,6 +32,14 @@ import {
 
 const ACCEPT = ".csv,.tsv,.txt,.parquet,.json,.jsonl,.ndjson";
 const MAX_ROWS = 500;
+/** Results with more rows than this prompt for confirmation before they are previewed. */
+const LARGE_RESULT_ROWS = 100_000;
+/** Exports with more rows than this prompt for confirmation before the file is written. */
+const LARGE_EXPORT_ROWS = 1_000_000;
+const EXPORT_MIME: Record<ExportFormat, string> = {
+  csv: "text/csv",
+  parquet: "application/vnd.apache.parquet",
+};
 const HISTORY_KEY = "quack-query:history";
 const HISTORY_MAX = 50;
 const HISTORY_ERROR_CHARS = 80;
@@ -137,6 +151,12 @@ function clear(node: HTMLElement): void {
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 // ---------------------------------------------------------------------------
@@ -262,17 +282,50 @@ function renderShell(root: HTMLElement): Shell {
 
 function renderTables(
   container: HTMLElement,
-  tables: TableProfile[],
+  dataset: DatasetProfile,
   onRemove: (table: string) => void,
 ): void {
   clear(container);
-  if (tables.length === 0) {
+  if (dataset.tables.length === 0) {
     container.hidden = true;
     return;
   }
   container.append(el("h2", { text: "Tables" }));
-  for (const profile of tables) container.append(tableCard(profile, onRemove));
+  for (const profile of dataset.tables) container.append(tableCard(profile, onRemove));
+  container.append(modelViewPanel(dataset));
   container.hidden = false;
+}
+
+/** Collapsible panel showing the exact system prompt the model receives for this dataset. */
+function modelViewPanel(dataset: DatasetProfile): HTMLDetailsElement {
+  const text = describeModelView(dataset);
+  const pre = el("pre", { text });
+  const copy = el("button", { className: "secondary", text: "Copy prompt" });
+  copy.type = "button";
+  copy.addEventListener("click", () => {
+    void navigator.clipboard
+      .writeText(text)
+      .then(() => {
+        copy.textContent = "Copied";
+        setTimeout(() => {
+          copy.textContent = "Copy prompt";
+        }, 1500);
+      })
+      .catch(() => {
+        copy.textContent = "Copy failed";
+      });
+  });
+  return el(
+    "details",
+    { className: "model-view" },
+    el("summary", { text: "What the model sees" }),
+    el("p", {
+      className: "muted",
+      text: "This is the exact system prompt sent with every question. Row data is never included.",
+    }),
+    pre,
+    el("div", { className: "model-view-actions" }, copy),
+  );
 }
 
 function tableCard(profile: TableProfile, onRemove: (table: string) => void): HTMLDivElement {
@@ -503,13 +556,8 @@ function renderHistory(
   container.hidden = false;
 }
 
-function renderResults(container: HTMLElement, result: QueryResult): void {
+function resultsTable(result: QueryResult): HTMLDivElement {
   const table = el("table");
-  const captionText = result.truncated
-    ? `${result.rowCount.toLocaleString()} rows (showing first ${result.rows.length.toLocaleString()})`
-    : `${result.rowCount.toLocaleString()} ${result.rowCount === 1 ? "row" : "rows"}`;
-  table.append(el("caption", { text: captionText }));
-
   const thead = el("thead");
   thead.append(el("tr", {}, ...result.columns.map((c) => el("th", { text: c }))));
   const tbody = el("tbody");
@@ -517,8 +565,59 @@ function renderResults(container: HTMLElement, result: QueryResult): void {
     tbody.append(el("tr", {}, ...row.map((v) => el("td", { text: formatValue(v) }))));
   }
   table.append(thead, tbody);
+  return el("div", { className: "table-wrap" }, table);
+}
 
-  container.replaceChildren(el("div", { className: "card" }, el("div", { className: "table-wrap" }, table)));
+function resultsCaption(result: QueryResult): string {
+  return result.truncated
+    ? `${result.rowCount.toLocaleString()} rows (showing first ${result.rows.length.toLocaleString()})`
+    : `${result.rowCount.toLocaleString()} ${result.rowCount === 1 ? "row" : "rows"}`;
+}
+
+interface ResultsActions {
+  onExport: (format: ExportFormat) => void;
+}
+
+/**
+ * Results card: caption, a Table/Chart toggle (when the result is chartable),
+ * export buttons, and the table or chart body.
+ */
+function renderResults(container: HTMLElement, result: QueryResult, actions: ResultsActions): void {
+  const body = el("div", { className: "results-body" });
+  const buttons = el("div", { className: "results-actions" });
+
+  const spec = chartSpec(result);
+  if (spec) {
+    const tableButton = el("button", { className: "secondary active", text: "Table" });
+    tableButton.type = "button";
+    const chartButton = el("button", { className: "secondary", text: "Chart" });
+    chartButton.type = "button";
+    const show = (chart: boolean): void => {
+      body.replaceChildren(chart ? renderChart(spec) : resultsTable(result));
+      chartButton.classList.toggle("active", chart);
+      tableButton.classList.toggle("active", !chart);
+    };
+    tableButton.addEventListener("click", () => show(false));
+    chartButton.addEventListener("click", () => show(true));
+    buttons.append(tableButton, chartButton);
+  }
+  for (const format of ["csv", "parquet"] as const) {
+    const button = el("button", { className: "secondary", text: `Export ${format === "csv" ? "CSV" : "Parquet"}` });
+    button.type = "button";
+    button.title = "Exports the full result of this query, not just the rows shown";
+    button.addEventListener("click", () => actions.onExport(format));
+    buttons.append(button);
+  }
+
+  body.append(resultsTable(result));
+  container.replaceChildren(
+    el(
+      "div",
+      { className: "card" },
+      el("div", { className: "results-header" }, el("span", { className: "caption", text: resultsCaption(result) }), buttons),
+      body,
+    ),
+  );
 }
 
 /** Fills the answer card with a label plus either the answer text or a muted note. */
@@ -622,6 +721,8 @@ function main(): void {
   let dbReady = false;
   let busy = false;
   let lastQuestion = "";
+  /** SQL and row count of the result currently on screen, for exports. */
+  let lastRun: { sql: string; rowCount: number } | null = null;
   let editor: SqlEditor | null = null;
   let history: HistoryEntry[] = loadHistory();
 
@@ -688,7 +789,7 @@ function main(): void {
   const currentQuestion = (): string => lastQuestion || ui.questionInput.value.trim() || "What does this query return?";
 
   const renderDataset = (): void => {
-    renderTables(ui.tables, dataset.tables, (table) => void handleRemove(table));
+    renderTables(ui.tables, dataset, (table) => void handleRemove(table));
     renderRelationships(ui.relationships, dataset);
     updateFormState();
   };
@@ -782,18 +883,41 @@ function main(): void {
     hideError(ui.error);
     clear(ui.results);
     hideAnswer(ui.answer);
+    lastRun = null;
     showOutput();
 
     try {
+      // Count first so the user can back out of an enormous result before any rows are fetched.
+      setStatus("Counting rows…");
+      let count: number | undefined;
+      try {
+        count = await countQuery(sql);
+      } catch {
+        count = undefined; // not a subquery-able statement; the preview falls back to a plain run
+      }
+      if (count !== undefined && count > LARGE_RESULT_ROWS) {
+        const proceed = window.confirm(
+          `This query returns ${count.toLocaleString()} rows. Only the first ${MAX_ROWS.toLocaleString()} ` +
+            `will be displayed and the written answer sees the first ${ANSWER_MAX_ROWS}. ` +
+            `You can export the full result afterwards. Continue?`,
+        );
+        if (!proceed) {
+          setStatus(`Cancelled. The query would return ${count.toLocaleString()} rows.`);
+          recordHistory({ question, sql, source, rowCount: count });
+          return;
+        }
+      }
+
       setStatus("Running query…");
-      const result = await runQuery(sql, MAX_ROWS);
+      const result = await runQueryPreview(sql, MAX_ROWS, count);
       const modelError = modelErrorFrom(result);
       if (modelError !== null) {
         setStatus("");
         showError(ui.error, modelError);
         recordHistory({ question, sql, source, error: modelError });
       } else {
-        renderResults(ui.results, result);
+        lastRun = { sql, rowCount: result.rowCount };
+        renderResults(ui.results, result, { onExport: (format) => void handleExport(format) });
         recordHistory({ question, sql, source, rowCount: result.rowCount });
         await writeAnswer(question, sql, result);
         setStatus("Done.");
@@ -803,6 +927,39 @@ function main(): void {
       setStatus("");
       showError(ui.error, message);
       recordHistory({ question, sql, source, error: message });
+    } finally {
+      busy = false;
+      updateFormState();
+    }
+  };
+
+  /** Exports the full result of the query on screen (not just the preview rows) as a download. */
+  const handleExport = async (format: ExportFormat): Promise<void> => {
+    if (!lastRun || busy || !dbReady) return;
+    const { sql, rowCount } = lastRun;
+    if (rowCount > LARGE_EXPORT_ROWS) {
+      const proceed = window.confirm(
+        `This export contains ${rowCount.toLocaleString()} rows and is written in your browser's memory first. Continue?`,
+      );
+      if (!proceed) return;
+    }
+    busy = true;
+    updateFormState();
+    const label = format === "csv" ? "CSV" : "Parquet";
+    setStatus(`Exporting ${label}…`);
+    try {
+      const bytes = await exportQuery(sql, format);
+      downloadBytes(exportFileName(currentQuestion(), format), bytes, EXPORT_MIME[format]);
+      setStatus(`Exported ${rowCount.toLocaleString()} rows as ${label} (${formatBytes(bytes.byteLength)}).`);
+    } catch (err) {
+      setStatus("");
+      let message = `Export failed: ${errorMessage(err)}`;
+      if (format === "parquet") {
+        message +=
+          "\nParquet support relies on DuckDB's parquet extension, which the browser fetches from " +
+          "extensions.duckdb.org the first time it is needed. Check that this site can reach it, then retry.";
+      }
+      showError(ui.error, message);
     } finally {
       busy = false;
       updateFormState();
