@@ -2,13 +2,14 @@
 
 Ask questions about a data file in plain English. The file never leaves your browser.
 
-Upload a CSV, Parquet, or JSON file, type a question, and Quack Query has Claude write a single read-only SQL query that DuckDB runs locally in your browser.
+Upload one or more CSV, Parquet, or JSON files, type a question, and Quack Query has an LLM write a single read-only SQL query that DuckDB runs locally in your browser. Each file becomes a table, and queries may join across them.
 
 ## How it works
 
-- **DuckDB Wasm in the browser.** The file is loaded into an in-memory DuckDB instance running as WebAssembly. All parsing and querying happens client-side.
-- **Automatic profile → system prompt.** After loading, the app computes a compact profile of the table (column names, DuckDB types, distinct/null counts, and the full value list for low-cardinality columns). That profile, plus your question, is all that is sent to the server.
-- **Serverless function returns SQL only.** `api/query.ts` sends the profile and question to an LLM and returns one read-only SELECT statement. The browser checks it is read-only, runs it in DuckDB, and shows the result table.
+- **DuckDB Wasm in the browser.** Every file is loaded into its own table in one in-memory DuckDB instance running as WebAssembly. All parsing, profiling, and querying happens client-side.
+- **Automatic profiles → system prompt.** After loading, the app profiles each table (column names, DuckDB types, distinct/null counts, min/max for numeric and date columns, a uniqueness flag, and the full value list for low-cardinality columns). All table profiles, plus your question, are what gets sent to the server.
+- **Relationship hints.** With two or more tables, the app looks for join keys: columns that share a name across tables, and column pairs whose values actually overlap (measured with a DuckDB join on distinct values). Numeric and date pairs are only considered when a column name looks like a key (`id`, `customer_id`, `sku`, …) or references the other table, so quantities and prices are not mistaken for ids. The hints are shown in the UI and included in the prompt, with the strongest ones marked as likely join keys.
+- **Serverless function returns SQL only.** `api/query.ts` sends the profiles, hints, and question to an LLM and returns one read-only SELECT statement, joins allowed. The browser checks it is read-only, runs it in DuckDB, and shows the query beside the results.
 
 ## LLM providers
 
