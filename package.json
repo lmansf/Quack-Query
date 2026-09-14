@@ -10,7 +10,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.80.0",
+    "@anthropic-ai/sdk": "^0.125.0",
     "@duckdb/duckdb-wasm": "^1.29.0",
     "apache-arrow": "^17.0.0"
   },

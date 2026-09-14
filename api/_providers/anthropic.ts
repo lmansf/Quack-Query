@@ -6,7 +6,7 @@ export const DEFAULT_ANTHROPIC_MODEL = "claude-opus-5";
 /** Anthropic provider: Claude with adaptive thinking and a cached system prompt. */
 export const anthropic: Provider = async ({ system, question }) => {
   if (!process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_AUTH_TOKEN) {
-    throw new ProviderError(500, "Server is missing a valid ANTHROPIC_API_KEY");
+    throw new ProviderError(500, "ANTHROPIC_API_KEY is not set for this deployment (add it in the project's environment variables for this environment and redeploy)");
   }
   const model = process.env.ANTHROPIC_MODEL || DEFAULT_ANTHROPIC_MODEL;
 
@@ -43,7 +43,7 @@ export const anthropic: Provider = async ({ system, question }) => {
   } catch (error) {
     if (error instanceof ProviderError) throw error;
     if (error instanceof Anthropic.AuthenticationError) {
-      throw new ProviderError(500, "Server is missing a valid ANTHROPIC_API_KEY");
+      throw new ProviderError(500, "Anthropic rejected the configured ANTHROPIC_API_KEY (HTTP 401). Check the key and redeploy after updating it");
     }
     if (error instanceof Anthropic.RateLimitError) {
       throw new ProviderError(429, "Rate limited by Anthropic; please retry shortly");

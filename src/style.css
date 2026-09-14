@@ -192,6 +192,17 @@ button.secondary:hover:not(:disabled) { background: var(--accent-soft); }
 
 .status { color: var(--muted); font-size: 0.9rem; min-height: 1.5em; margin: 8px 0; }
 
+label.option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+label.option input { margin: 0; accent-color: var(--accent); }
+
 /* Output: SQL (~40%) beside results (~60%), stacking on narrow screens */
 .output {
   display: grid;

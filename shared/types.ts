@@ -27,6 +27,12 @@ export interface ColumnProfile {
    * stringified for transport.
    */
   values?: string[];
+  /**
+   * True when the column is low-cardinality but its values were withheld from
+   * the profile because the column looks personal (emails, phone numbers,
+   * people's names, identifiers such as SSN or passport, secrets).
+   */
+  valuesWithheld?: boolean;
 }
 
 /** Profile of one uploaded table. */

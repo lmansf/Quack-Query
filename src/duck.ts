@@ -30,6 +30,8 @@ interface LoadedTable {
   /** Name the browser File is registered under in DuckDB's virtual FS. */
   registeredName: string;
   profile: TableProfile;
+  /** Kept so tables can be rebuilt after an engine restart. */
+  file: File;
 }
 
 let dbPromise: Promise<duckdb.AsyncDuckDB> | null = null;
@@ -37,9 +39,28 @@ let connPromise: Promise<duckdb.AsyncDuckDBConnection> | null = null;
 /** table name -> loaded table, in insertion order. */
 const tables = new Map<string, LoadedTable>();
 
+/**
+ * Every file DuckDB may touch lives under this virtual prefix. At startup the
+ * database is locked so that only this prefix is accessible: model-generated
+ * SQL cannot read URLs or other files no matter how it is written.
+ */
+const UPLOAD_PREFIX = 'uploads/';
+/** Extensions that must be present before the lock, since loading is refused afterwards. */
+const PRELOAD_EXTENSIONS = ['parquet', 'json'];
+/** Wall-clock limits; a query past its limit is cancelled inside the worker. */
+const QUERY_TIMEOUT_MS = 60_000;
+const EXPORT_TIMEOUT_MS = 300_000;
+
+const extensionErrors = new Map<string, string>();
+
+/** Names of extensions that failed to load at startup (their features will error later). */
+export function unavailableExtensions(): string[] {
+  return Array.from(extensionErrors.keys());
+}
+
 /** Instantiates the single DuckDB-Wasm instance. Safe to call repeatedly. */
 export async function initDuckDB(): Promise<void> {
-  await getDb();
+  await getConn();
 }
 
 function getDb(): Promise<duckdb.AsyncDuckDB> {
@@ -59,9 +80,100 @@ function getDb(): Promise<duckdb.AsyncDuckDB> {
   return dbPromise;
 }
 
+/**
+ * Opens the shared connection and locks the database down:
+ * 1. allow file access only under UPLOAD_PREFIX,
+ * 2. load the extensions uploads/exports need (network fetch, best effort),
+ * 3. disable all other external access and extension loading,
+ * 4. lock the configuration so no statement can undo the above.
+ */
 function getConn(): Promise<duckdb.AsyncDuckDBConnection> {
-  if (!connPromise) connPromise = getDb().then((db) => db.connect());
+  if (!connPromise) {
+    connPromise = (async () => {
+      const db = await getDb();
+      const conn = await db.connect();
+      await conn.query(`SET allowed_directories = [${quoteLiteral(UPLOAD_PREFIX)}]`);
+      for (const ext of PRELOAD_EXTENSIONS) {
+        try {
+          await conn.query(`LOAD ${ext}`);
+        } catch (err) {
+          extensionErrors.set(ext, err instanceof Error ? err.message : String(err));
+        }
+      }
+      await conn.query('SET autoinstall_known_extensions = false');
+      await conn.query('SET autoload_known_extensions = false');
+      await conn.query('SET enable_external_access = false');
+      await conn.query('SET lock_configuration = true');
+      return conn;
+    })();
+  }
   return connPromise;
+}
+
+let resetting: Promise<void> | null = null;
+
+/**
+ * Tears down a wedged engine and rebuilds it from the original File objects.
+ * DuckDB-Wasm runs single-threaded in its worker, so a runaway query cannot be
+ * interrupted; terminating the worker is the only way to get the tab back.
+ */
+function resetEngine(): Promise<void> {
+  if (!resetting) {
+    resetting = (async () => {
+      const old = dbPromise;
+      dbPromise = null;
+      connPromise = null;
+      extensionErrors.clear();
+      if (old) await old.then((db) => db.terminate()).catch(() => null);
+      const entries = Array.from(tables.values());
+      tables.clear();
+      const failures: string[] = [];
+      for (const entry of entries) {
+        try {
+          await addFile(entry.file);
+        } catch (err) {
+          failures.push(`${entry.fileName}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+      if (failures.length > 0) throw new Error(`Some tables could not be reloaded — ${failures.join('; ')}`);
+    })().finally(() => {
+      resetting = null;
+    });
+  }
+  return resetting;
+}
+
+/**
+ * Runs a statement with a wall-clock limit. On timeout the engine is restarted
+ * (the running query cannot be interrupted), the loaded files are re-added,
+ * and an error is thrown.
+ */
+async function queryWithTimeout(
+  conn: duckdb.AsyncDuckDBConnection,
+  sql: string,
+  timeoutMs: number,
+): Promise<ArrowTable> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error('timeout')), timeoutMs);
+  });
+  try {
+    return await Promise.race([conn.query(sql), timeout]);
+  } catch (err) {
+    if (err instanceof Error && err.message === 'timeout') {
+      const seconds = Math.round(timeoutMs / 1000);
+      let note = 'The database was restarted and your files were reloaded.';
+      try {
+        await resetEngine();
+      } catch (resetErr) {
+        note = resetErr instanceof Error ? resetErr.message : String(resetErr);
+      }
+      throw new Error(`Query stopped after ${seconds} seconds. ${note}`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /** Quotes a SQL identifier, doubling embedded double quotes. */
@@ -103,15 +215,23 @@ export async function addFile(file: File): Promise<TableProfile> {
   const reader = readerFor(file.name); // throws early for unsupported types
   const db = await getDb();
   const conn = await getConn();
+  const needs = reader === 'read_parquet' ? 'parquet' : reader === 'read_json_auto' ? 'json' : null;
+  const missing = needs ? extensionErrors.get(needs) : undefined;
+  if (needs && missing) {
+    throw new Error(
+      `Reading ${needs} files needs DuckDB's ${needs} extension, which could not be downloaded from ` +
+        `extensions.duckdb.org when the page loaded (${missing}). Reload the page to try again.`,
+    );
+  }
   const table = tableNameFor(file.name);
-  const registeredName = `${table}__${file.name}`;
+  const registeredName = `${UPLOAD_PREFIX}${table}__${file.name}`;
   await db.registerFileHandle(registeredName, file, duckdb.DuckDBDataProtocol.BROWSER_FILEREADER, true);
   try {
     await conn.query(
       `CREATE TABLE ${quoteIdent(table)} AS SELECT * FROM ${reader}(${quoteLiteral(registeredName)})`,
     );
     const profile = await profileTable(table, file.name);
-    tables.set(table, { fileName: file.name, registeredName, profile });
+    tables.set(table, { fileName: file.name, registeredName, profile, file });
     return profile;
   } catch (err) {
     await conn.query(`DROP TABLE IF EXISTS ${quoteIdent(table)}`).catch(() => null);
@@ -198,11 +318,37 @@ async function profileTable(table: string, fileName: string): Promise<TableProfi
       const res = await conn.query(
         `SELECT DISTINCT ${q} FROM ${t} WHERE ${q} IS NOT NULL ORDER BY 1 LIMIT ${LOW_CARDINALITY_LIMIT}`,
       );
-      col.values = vectorValues(res, 0).map(formatValue);
+      const values = vectorValues(res, 0).map(formatValue);
+      // Personal data stays in the browser: the model learns the column exists, not its contents.
+      if (looksSensitive(name, values)) col.valuesWithheld = true;
+      else col.values = values;
     }
     columns.push(col);
   }
   return { table, fileName, rowCount, columns };
+}
+
+/** Column names that conventionally hold personal or secret data. */
+const SENSITIVE_NAME_RE =
+  /(^|[_\s-])(e-?mail|phone|mobile|tel|fax|ssn|social|passport|licen[cs]e|iban|swift|bic|account|acct|card|cvv|pin|password|passwd|pwd|token|secret|api_?key|dob|birth(day|date)?|address|street|zip|postal|postcode|salary|income|diagnosis|username|user_?name|login|ip)($|[_\s-])/i;
+/** Names that by themselves denote a person. */
+const PERSON_NAME_RE = /^(name|full_?name|first_?name|last_?name|surname|customer_?name|person|patient|employee|contact|author|owner)$/i;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const PHONE_RE = /^\+?[\d\s().-]{7,}$/;
+
+/**
+ * Heuristic used to keep personal data out of the schema profile: true when
+ * the column name suggests PII or secrets, or when most values look like
+ * email addresses or phone numbers.
+ */
+export function looksSensitive(name: string, values: string[]): boolean {
+  const n = name.trim();
+  if (SENSITIVE_NAME_RE.test(n) || PERSON_NAME_RE.test(n)) return true;
+  const nonEmpty = values.filter((v) => v.trim() !== '');
+  if (nonEmpty.length === 0) return false;
+  const emails = nonEmpty.filter((v) => EMAIL_RE.test(v)).length;
+  const phones = nonEmpty.filter((v) => PHONE_RE.test(v) && /\d{7,}/.test(v.replace(/\D/g, ''))).length;
+  return emails / nonEmpty.length >= 0.5 || phones / nonEmpty.length >= 0.5;
 }
 
 /** Builds the aggregate expressions for one column, aliased by its index. */
@@ -539,7 +685,7 @@ function toPlain(v: unknown): unknown {
 /** Runs a SQL statement and returns up to `maxRows` rows with raw JS values. */
 export async function runQuery(sql: string, maxRows = 500): Promise<QueryResult> {
   const conn = await getConn();
-  const table = await conn.query(sql);
+  const table = await queryWithTimeout(conn, sql, QUERY_TIMEOUT_MS);
   const columns = table.schema.fields.map((f) => f.name);
   const rowCount = table.numRows;
   const limit = Math.min(rowCount, maxRows);
@@ -580,13 +726,15 @@ export async function exportQuery(sql: string, format: ExportFormat): Promise<Ui
   const db = await getDb();
   const conn = await getConn();
   const inner = subqueryText(sql);
-  const name = `export_${Date.now()}_${exportCounter++}.${format}`;
+  const name = `${UPLOAD_PREFIX}export_${Date.now()}_${exportCounter++}.${format}`;
   const options = format === 'csv' ? 'FORMAT CSV, HEADER true' : 'FORMAT PARQUET';
+  const missing = extensionErrors.get(format);
+  if (missing) throw new Error(`DuckDB's ${format} extension did not load at startup (${missing})`);
   try {
     // Pre-register the target as an in-memory buffer file (DuckDB-Wasm's documented
     // COPY-to-buffer pattern); the COPY below then writes into the virtual FS.
     await db.registerEmptyFileBuffer(name);
-    await conn.query(`COPY (${inner}) TO ${quoteLiteral(name)} (${options})`);
+    await queryWithTimeout(conn, `COPY (${inner}) TO ${quoteLiteral(name)} (${options})`, EXPORT_TIMEOUT_MS);
     return await db.copyFileToBuffer(name);
   } finally {
     await db.dropFile(name).catch(() => null);
@@ -605,7 +753,7 @@ function subqueryText(sql: string): string {
  */
 export async function countQuery(sql: string): Promise<number> {
   const conn = await getConn();
-  const res = await conn.query(`SELECT count(*) AS n FROM (${subqueryText(sql)}) AS q`);
+  const res = await queryWithTimeout(conn, `SELECT count(*) AS n FROM (${subqueryText(sql)}) AS q`, QUERY_TIMEOUT_MS);
   return Number(res.getChildAt(0)?.get(0) ?? 0);
 }
 

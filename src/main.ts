@@ -15,6 +15,7 @@ import {
 import { chartSpec, renderChart } from "./chart";
 import { downloadBytes, exportFileName } from "./download";
 import { describeModelView } from "../shared/prompt";
+import { externalReference } from "../shared/sql";
 import {
   ANSWER_MAX_CELL_CHARS,
   ANSWER_MAX_COLUMNS,
@@ -178,6 +179,7 @@ interface Shell {
   results: HTMLDivElement;
   answer: HTMLDivElement;
   history: HTMLElement;
+  answerToggle: HTMLInputElement;
 }
 
 function renderShell(root: HTMLElement): Shell {
@@ -185,7 +187,7 @@ function renderShell(root: HTMLElement): Shell {
     "header",
     {},
     el("h1", { text: "Quack Query" }),
-    el("p", { text: "Ask questions about your files. They never leave your browser." }),
+    el("p", { text: "Ask questions about your files. The files stay in your browser; the model only sees a schema summary and small result samples." }),
   );
 
   const fileInput = el("input");
@@ -221,6 +223,17 @@ function renderShell(root: HTMLElement): Shell {
 
   const form = el("form", { className: "question" }, questionInput, askButton);
 
+  const answerToggle = el("input");
+  answerToggle.type = "checkbox";
+  answerToggle.checked = readAnswerPreference();
+  answerToggle.addEventListener("change", () => saveAnswerPreference(answerToggle.checked));
+  const answerOption = el(
+    "label",
+    { className: "option" },
+    answerToggle,
+    " Write a plain-language answer (sends the first 50 result rows to the model)",
+  );
+
   const status = el("div", { className: "status" });
   const error = el("div", { className: "error" });
   error.hidden = true;
@@ -251,7 +264,7 @@ function renderShell(root: HTMLElement): Shell {
     el("section", {}, dropzone),
     tables,
     relationships,
-    el("section", {}, form, status),
+    el("section", {}, form, answerOption, status),
     error,
     output,
     history,
@@ -273,7 +286,27 @@ function renderShell(root: HTMLElement): Shell {
     results,
     answer,
     history,
+    answerToggle,
   };
+}
+
+const ANSWER_PREF_KEY = "quack-query:answer-step";
+
+/** Whether the answer step is enabled (default on); remembered per browser. */
+function readAnswerPreference(): boolean {
+  try {
+    return localStorage.getItem(ANSWER_PREF_KEY) !== "off";
+  } catch {
+    return true;
+  }
+}
+
+function saveAnswerPreference(enabled: boolean): void {
+  try {
+    localStorage.setItem(ANSWER_PREF_KEY, enabled ? "on" : "off");
+  } catch {
+    // Storage unavailable: the choice lasts for this page only.
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -370,9 +403,10 @@ function tableCard(profile: TableProfile, onRemove: (table: string) => void): HT
 function profileRow(col: ColumnProfile): HTMLTableRowElement {
   const distinct = col.distinctCount === -1 ? "—" : col.distinctCount.toLocaleString();
   const range = col.min !== undefined && col.max !== undefined ? `${col.min} – ${col.max}` : "";
-  const valuesText = col.values ? col.values.join(", ") : "";
-  const valuesCell = el("td", { className: "values", text: valuesText });
-  if (valuesText) valuesCell.title = valuesText;
+  const valuesText = col.values ? col.values.join(", ") : col.valuesWithheld ? "withheld (looks personal)" : "";
+  const valuesCell = el("td", { className: col.valuesWithheld ? "values muted" : "values", text: valuesText });
+  if (col.values && valuesText) valuesCell.title = valuesText;
+  if (col.valuesWithheld) valuesCell.title = "This column looks like personal data, so its values are not sent to the model.";
 
   const nameCell = el("td", { text: col.name });
   if (col.unique) {
@@ -886,6 +920,18 @@ function main(): void {
     lastRun = null;
     showOutput();
 
+    // Loaded tables are the only data source; anything reaching outside the tab is refused.
+    const external = externalReference(sql);
+    if (external !== null) {
+      const message = `This query references ${external}, which is not allowed. Queries may only read the loaded tables.`;
+      setStatus("");
+      showError(ui.error, message);
+      recordHistory({ question, sql, source, error: message });
+      busy = false;
+      updateFormState();
+      return;
+    }
+
     try {
       // Count first so the user can back out of an enormous result before any rows are fetched.
       setStatus("Counting rows…");
@@ -919,7 +965,7 @@ function main(): void {
         lastRun = { sql, rowCount: result.rowCount };
         renderResults(ui.results, result, { onExport: (format) => void handleExport(format) });
         recordHistory({ question, sql, source, rowCount: result.rowCount });
-        await writeAnswer(question, sql, result);
+        if (ui.answerToggle.checked) await writeAnswer(question, sql, result);
         setStatus("Done.");
       }
     } catch (err) {

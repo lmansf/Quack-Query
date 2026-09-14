@@ -9,6 +9,7 @@ import {
 import { ProviderError } from "./_providers/types.js";
 import { selectProvider } from "./_providers/select.js";
 import { jsonResponse } from "./_providers/http.js";
+import { guardRequest, readJsonBody } from "./_providers/guard.js";
 
 const MAX_QUESTION_LENGTH = 2000;
 const MAX_SQL_LENGTH = 20000;
@@ -90,13 +91,11 @@ function json(status: number, body: AnswerResponse | QueryError): Response {
 
 export async function POST(request: Request): Promise<Response> {
   if (request.method !== "POST") return json(405, { error: "Method not allowed" });
+  const blocked = guardRequest(request);
+  if (blocked) return blocked;
 
-  let parsed: unknown;
-  try {
-    parsed = await request.json();
-  } catch {
-    return json(400, { error: "Request body must be valid JSON" });
-  }
+  const parsed = await readJsonBody(request);
+  if (parsed instanceof Response) return parsed;
   const input = validate(parsed);
   if (typeof input === "string") return json(400, { error: input });
 

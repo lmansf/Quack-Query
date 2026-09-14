@@ -10,7 +10,8 @@ import { ProviderError, type Provider, type ProviderResult } from "./types.js";
  * can use right now.
  */
 export const DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b";
-const MISSING_KEY = "Server is missing a valid GROQ_API_KEY";
+const MISSING_KEY = "GROQ_API_KEY is not set for this deployment (add it in the project's environment variables for this environment and redeploy)";
+const REJECTED_KEY = "Groq rejected the configured GROQ_API_KEY (HTTP 401). Check the key in console.groq.com/keys and redeploy after updating it";
 const MODEL_HINT = "Set GROQ_MODEL to a model your key can use; GET /api/query?models=1 lists them.";
 
 function groqBaseUrl(): string {
@@ -29,7 +30,7 @@ export async function listGroqModels(): Promise<string[]> {
   }
   const raw = await res.text();
   if (!res.ok) {
-    if (res.status === 401 || res.status === 403) throw new ProviderError(500, MISSING_KEY);
+    if (res.status === 401) throw new ProviderError(500, REJECTED_KEY);
     throw new ProviderError(502, `Groq error (${res.status}): ${errorMessage(raw)}`);
   }
   let json: unknown;
@@ -117,7 +118,8 @@ export const groq: Provider = async (input) => {
   if (!res.ok) {
     const message = errorMessage(raw);
     const { status } = res;
-    if (status === 401 || status === 403) throw new ProviderError(500, MISSING_KEY);
+    if (status === 401) throw new ProviderError(500, REJECTED_KEY);
+    if (status === 403) throw new ProviderError(502, `Groq refused the request (403): ${message}`);
     if (status === 429) throw new ProviderError(429, "Rate limited by Groq; please retry shortly");
     if (status === 404 || /model/i.test(message)) {
       throw new ProviderError(502, `Groq rejected the request (${status}): ${message.replace(/\.+$/, "")}. ${MODEL_HINT}`);
