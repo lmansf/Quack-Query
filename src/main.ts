@@ -445,7 +445,7 @@ function renderModelView(container: HTMLDetailsElement, dataset: DatasetProfile)
       { className: "details-body" },
       el("p", {
         className: "muted",
-        text: "This is the exact system prompt sent with every question. Row data is never included.",
+        text: "This is the exact system prompt sent with every question. It never contains row data; only the optional written answer sends result rows.",
       }),
       pre,
       el("div", { className: "model-view-actions" }, copy),
