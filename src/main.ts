@@ -3,6 +3,8 @@ import { inject } from "@vercel/analytics";
 import {
   initDuckDB,
   addFile,
+  addText,
+  looksTabular,
   removeTable,
   buildDataset,
   countQuery,
@@ -35,7 +37,9 @@ import {
 // Initialize Vercel Web Analytics
 inject();
 
-const ACCEPT = ".csv,.tsv,.txt,.parquet,.json,.jsonl,.ndjson";
+/** Hint for the file picker only; dropped files of any type are accepted and sniffed. */
+const ACCEPT = ".csv,.tsv,.txt,.parquet,.json,.jsonl,.ndjson,.xlsx,.xlsm,.gz";
+const INTAKE_HINT = "Drop files (CSV, Excel, Parquet, JSON, or any delimited text) or paste cells from a spreadsheet.";
 const MAX_ROWS = 500;
 /** Results with more rows than this prompt for confirmation before they are previewed. */
 const LARGE_RESULT_ROWS = 100_000;
@@ -172,6 +176,13 @@ interface Shell {
   dropzone: HTMLDivElement;
   fileInput: HTMLInputElement;
   addFiles: HTMLButtonElement;
+  /** "Paste data" buttons: one in the empty-state dropzone, one in the Data header. */
+  pasteButtons: HTMLButtonElement[];
+  /** Inline panel with a textarea for pasting rows; moved between the two layouts. */
+  pastePanel: HTMLDivElement;
+  pasteBox: HTMLTextAreaElement;
+  pasteLoad: HTMLButtonElement;
+  pasteCancel: HTMLButtonElement;
   /** Secondary "Data" section: table cards, relationships, and the model view. */
   data: HTMLElement;
   tables: HTMLDivElement;
@@ -210,34 +221,61 @@ function renderShell(root: HTMLElement): Shell {
   fileInput.multiple = true;
   fileInput.hidden = true;
 
+  const pasteInDropzone = el("button", { className: "secondary", text: "Paste data" });
+  pasteInDropzone.type = "button";
+  pasteInDropzone.disabled = true;
+
   const dropzone = el(
     "div",
     { className: "dropzone" },
-    el("p", { text: "Drop CSV, Parquet, or JSON files here. Each file becomes a table." }),
-    el("button", { text: "Choose files" }),
+    el("p", {
+      text:
+        "Drop CSV, Excel (.xlsx), Parquet, JSON, or any delimited text file here — or paste cells " +
+        "straight from a spreadsheet. Each file or sheet becomes a table.",
+    }),
+    el("div", { className: "dropzone-actions" }, el("button", { text: "Choose files" }), pasteInDropzone),
     fileInput,
   );
   dropzone.tabIndex = 0;
 
+  // Inline "paste rows here" panel for people whose browser makes paste events awkward.
+  const pasteBox = el("textarea", { className: "paste-box" });
+  pasteBox.placeholder = "Paste rows here (tab, comma, semicolon, or pipe separated; first row = header)";
+  pasteBox.spellcheck = false;
+  pasteBox.setAttribute("aria-label", "Pasted rows");
+  const pasteLoad = el("button", { text: "Load" });
+  pasteLoad.type = "button";
+  const pasteCancel = el("button", { className: "secondary", text: "Cancel" });
+  pasteCancel.type = "button";
+  const pastePanel = el(
+    "div",
+    { className: "paste-panel card" },
+    pasteBox,
+    el("div", { className: "paste-actions" }, pasteLoad, pasteCancel),
+  );
+  pastePanel.hidden = true;
+
   const status = el("div", { className: "status" });
-  const upload = el("section", { className: "upload" }, dropzone, status);
+  const upload = el("section", { className: "upload" }, dropzone, pastePanel, status);
 
   // --- secondary: data ------------------------------------------------------
   const addFiles = el("button", { className: "secondary", text: "Add files" });
   addFiles.type = "button";
   addFiles.disabled = true;
+  const pasteInData = el("button", { className: "secondary", text: "Paste data" });
+  pasteInData.type = "button";
+  pasteInData.disabled = true;
   const tables = el("div", { className: "tables" });
   const relationships = el("details", { className: "relationships" });
   relationships.hidden = true;
   const modelView = el("details", { className: "model-view" });
-  const data = el(
-    "section",
-    { className: "data" },
-    el("div", { className: "data-header" }, el("h2", { text: "Data" }), addFiles),
-    tables,
-    relationships,
-    modelView,
+  const dataHeader = el(
+    "div",
+    { className: "data-header" },
+    el("h2", { text: "Data" }),
+    el("div", { className: "data-actions" }, addFiles, pasteInData),
   );
+  const data = el("section", { className: "data" }, dataHeader, tables, relationships, modelView);
   data.hidden = true;
 
   // --- primary: ask ---------------------------------------------------------
@@ -306,9 +344,10 @@ function renderShell(root: HTMLElement): Shell {
     data.hidden = !hasTables;
     if (hasTables) {
       ask.append(status);
+      dataHeader.after(pastePanel);
       root.append(header, upload, ask, error, output, data, history, footer);
     } else {
-      upload.append(status);
+      upload.append(pastePanel, status);
       root.append(header, upload, ask, error, output, history, data, footer);
     }
   };
@@ -319,6 +358,11 @@ function renderShell(root: HTMLElement): Shell {
     dropzone,
     fileInput,
     addFiles,
+    pasteButtons: [pasteInDropzone, pasteInData],
+    pastePanel,
+    pasteBox,
+    pasteLoad,
+    pasteCancel,
     data,
     tables,
     relationships,
@@ -864,6 +908,8 @@ function main(): void {
     ui.questionInput.disabled = !enabled;
     ui.askButton.disabled = !enabled;
     ui.addFiles.disabled = !dbReady || busy;
+    for (const b of ui.pasteButtons) b.disabled = !dbReady || busy;
+    ui.pasteLoad.disabled = !dbReady || busy;
     if (editor) editor.run.disabled = busy || !dbReady;
     refreshHistory();
   };
@@ -924,10 +970,11 @@ function main(): void {
 
     const failures: string[] = [];
     let loaded = 0;
+    let created = 0;
     for (const [i, file] of files.entries()) {
       setStatus(files.length > 1 ? `Loading ${file.name} (${i + 1} of ${files.length})…` : `Loading ${file.name}…`);
       try {
-        await addFile(file);
+        created += (await addFile(file)).length;
         loaded += 1;
       } catch (err) {
         failures.push(`Could not load ${file.name}: ${errorMessage(err)}`);
@@ -942,8 +989,9 @@ function main(): void {
 
     if (failures.length > 0) showError(ui.error, failures.join("\n"));
     if (loaded > 0) {
-      const count = dataset.tables.length;
-      setStatus(`Loaded ${loaded} ${loaded === 1 ? "file" : "files"}. ${count} ${count === 1 ? "table" : "tables"} ready. Ask a question.`);
+      setStatus(
+        `Loaded ${loaded} ${loaded === 1 ? "file" : "files"} → ${created} ${created === 1 ? "table" : "tables"}. Ask a question.`,
+      );
     } else {
       setStatus("");
     }
@@ -951,6 +999,42 @@ function main(): void {
     busy = false;
     updateFormState();
     if (loaded > 0 && dataset.tables.length > 0) ui.questionInput.focus();
+  };
+
+  /** Loads pasted delimited text as a table named `pasted` (then `pasted_2`, ...). */
+  const handlePaste = async (text: string): Promise<void> => {
+    if (!dbReady || busy || !text.trim()) return;
+    busy = true;
+    updateFormState();
+    resetOutput();
+    setStatus("Loading pasted table…");
+    try {
+      const [profile] = await addText("pasted", text);
+      await refreshDataset();
+      if (profile) {
+        setStatus(
+          `Loaded pasted data as table ${profile.table} (${profile.rowCount.toLocaleString()} ${profile.rowCount === 1 ? "row" : "rows"}). Ask a question.`,
+        );
+      }
+      hidePastePanel();
+    } catch (err) {
+      setStatus("");
+      showError(ui.error, `Could not load the pasted data: ${errorMessage(err)}`);
+    } finally {
+      busy = false;
+      updateFormState();
+      if (dataset.tables.length > 0) ui.questionInput.focus();
+    }
+  };
+
+  const showPastePanel = (): void => {
+    ui.pastePanel.hidden = false;
+    ui.pasteBox.focus();
+  };
+
+  const hidePastePanel = (): void => {
+    ui.pastePanel.hidden = true;
+    ui.pasteBox.value = "";
   };
 
   const handleRemove = async (table: string): Promise<void> => {
@@ -963,9 +1047,7 @@ function main(): void {
       await removeTable(table);
       await refreshDataset();
       setStatus(
-        dataset.tables.length === 0
-          ? "All tables removed. Upload a CSV, Parquet, or JSON file."
-          : `Removed ${table}.`,
+        dataset.tables.length === 0 ? `All tables removed. ${INTAKE_HINT}` : `Removed ${table}.`,
       );
     } catch (err) {
       setStatus("");
@@ -1176,6 +1258,44 @@ function main(): void {
 
   ui.addFiles.addEventListener("click", () => ui.fileInput.click());
 
+  // --- pasting --------------------------------------------------------------
+
+  for (const button of ui.pasteButtons) {
+    // The dropzone opens the file picker on click/Enter; the button inside it must not.
+    button.addEventListener("click", (e) => {
+      e.stopPropagation();
+      showPastePanel();
+    });
+    button.addEventListener("keydown", (e) => e.stopPropagation());
+  }
+  ui.pastePanel.addEventListener("click", (e) => e.stopPropagation());
+  ui.pasteLoad.addEventListener("click", () => void handlePaste(ui.pasteBox.value));
+  ui.pasteCancel.addEventListener("click", hidePastePanel);
+  ui.pasteBox.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      void handlePaste(ui.pasteBox.value);
+    } else if (e.key === "Escape") {
+      hidePastePanel();
+    }
+  });
+
+  /**
+   * Cells copied from a spreadsheet arrive as tab-separated text. Pasting them
+   * anywhere on the page (except into the SQL editor or the paste box, which
+   * want the raw text) loads them as a table. In the question box a one-line
+   * paste is still a question; only multi-line tabular text is intercepted.
+   */
+  document.addEventListener("paste", (e) => {
+    const target = e.target;
+    if (target instanceof HTMLTextAreaElement && (target.classList.contains("sql") || target === ui.pasteBox)) return;
+    const text = e.clipboardData?.getData("text/plain") ?? "";
+    if (!looksTabular(text)) return;
+    if (target === ui.questionInput && !/\r?\n/.test(text.trim())) return;
+    e.preventDefault();
+    void handlePaste(text);
+  });
+
   /** Makes `target` accept dropped files, outlining it with `.dragover` while a drag hovers. */
   const attachDropTarget = (target: HTMLElement): void => {
     target.addEventListener("dragover", (e) => {
@@ -1211,7 +1331,7 @@ function main(): void {
   initDuckDB()
     .then(() => {
       dbReady = true;
-      setStatus("Ready. Upload one or more CSV, Parquet, or JSON files.");
+      setStatus(`Ready. ${INTAKE_HINT}`);
     })
     .catch((err: unknown) => {
       setStatus("");

@@ -64,6 +64,42 @@ section > h2,
 .dropzone.dragover { border-color: var(--accent); background: #fff8f0; }
 .dropzone p { margin: 0 0 10px; color: var(--muted); }
 
+.dropzone-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  align-items: center;
+  gap: 10px;
+}
+
+/* Inline "paste rows here" panel (below the dropzone, or under the Data header) */
+.paste-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 12px 0;
+}
+
+.paste-panel .paste-box {
+  width: 100%;
+  min-height: 8em;
+  padding: 10px 12px;
+  font: 0.9rem/1.45 var(--mono);
+  color: var(--fg);
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  resize: vertical;
+}
+
+.paste-panel .paste-box:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+.paste-panel .paste-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .card {
   background: var(--card);
   border: 1px solid var(--border);
@@ -113,6 +149,7 @@ section > h2,
 }
 
 .data-header > h2 { margin: 0; }
+.data-header .data-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 
 /* Vertical stack of collapsible table cards */
 .tables { display: flex; flex-direction: column; gap: 10px; }

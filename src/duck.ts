@@ -1,6 +1,7 @@
 /**
  * Thin wrapper around DuckDB-Wasm: one lazily-created database, one reused
- * connection, any number of loaded tables (one per uploaded file). Everything
+ * connection, any number of loaded tables (one per uploaded file, sheet, or
+ * pasted block of text). Everything
  * runs in the browser. Besides loading and profiling, this module computes
  * cross-table relationship hints (shared column names and value overlap).
  */
@@ -12,6 +13,7 @@ import ehWorker from '@duckdb/duckdb-wasm/dist/duckdb-browser-eh.worker.js?url';
 import { DataType, type Field, type Table as ArrowTable } from 'apache-arrow';
 import { LOW_CARDINALITY_LIMIT, MAX_OVERLAP_PAIRS, MIN_OVERLAP_FRACTION } from '../shared/types';
 import type { ColumnProfile, DatasetProfile, RelationshipHint, TableProfile } from '../shared/types';
+import { xlsxToSheets } from './xlsx';
 
 export { isReadOnlySql } from '../shared/sql';
 
@@ -30,8 +32,13 @@ interface LoadedTable {
   /** Name the browser File is registered under in DuckDB's virtual FS. */
   registeredName: string;
   profile: TableProfile;
-  /** Kept so tables can be rebuilt after an engine restart. */
+  /**
+   * Kept so tables can be rebuilt after an engine restart. Several tables may
+   * share one File (one per sheet of a workbook).
+   */
   file: File;
+  /** Set for pasted text, which is replayed through `addText` on restart. */
+  pastedAs?: string;
 }
 
 let dbPromise: Promise<duckdb.AsyncDuckDB> | null = null;
@@ -128,9 +135,14 @@ function resetEngine(): Promise<void> {
       const entries = Array.from(tables.values());
       tables.clear();
       const failures: string[] = [];
+      // A workbook contributes one entry per sheet but must be re-added once.
+      const seen = new Set<File>();
       for (const entry of entries) {
+        if (seen.has(entry.file)) continue;
+        seen.add(entry.file);
         try {
-          await addFile(entry.file);
+          if (entry.pastedAs !== undefined) await addText(entry.pastedAs, await entry.file.text());
+          else await addFile(entry.file);
         } catch (err) {
           failures.push(`${entry.fileName}: ${err instanceof Error ? err.message : String(err)}`);
         }
@@ -186,35 +198,73 @@ function quoteLiteral(value: string): string {
   return `'${value.replace(/'/g, "''")}'`;
 }
 
-/** Derives a safe table name from a file name, made unique among loaded tables. */
-function tableNameFor(fileName: string): string {
-  let base = fileName.replace(/\.[^.]*$/, '').toLowerCase();
-  base = base.replace(/[^a-z0-9_]+/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
+/** Strips the last extension (and a `.gz` before it) from a file name. */
+function baseName(fileName: string): string {
+  return fileName.replace(/\.gz$/i, '').replace(/\.[^.]*$/, '');
+}
+
+/** Turns arbitrary text into a safe, lower-case SQL identifier. */
+function sanitizeName(raw: string): string {
+  let base = raw.toLowerCase().replace(/[^a-z0-9_]+/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
   if (/^[0-9]/.test(base)) base = `t_${base}`;
-  base = base || 'data';
+  return base || 'data';
+}
+
+/** Makes a sanitized base name unique among loaded tables (`name`, `name_2`, ...). */
+function uniqueTableName(base: string): string {
   let name = base;
   for (let i = 2; tables.has(name); i++) name = `${base}_${i}`;
   return name;
 }
 
-function readerFor(fileName: string): string {
-  const ext = (fileName.match(/\.([^.]+)$/)?.[1] ?? '').toLowerCase();
+/** Derives a safe table name from a file name, made unique among loaded tables. */
+function tableNameFor(fileName: string): string {
+  return uniqueTableName(sanitizeName(baseName(fileName)));
+}
+
+type Reader = 'read_csv_auto' | 'read_parquet' | 'read_json_auto';
+
+/**
+ * How a file is loaded, decided from its name:
+ * - `reader`: a known DuckDB reader (optionally over gzip);
+ * - `workbook`: an Excel file, converted sheet by sheet to CSV in JavaScript;
+ * - `sniff`: unknown extension, try CSV then JSON.
+ */
+type LoadPlan =
+  | { kind: 'reader'; reader: Reader; gzip: boolean }
+  | { kind: 'workbook' }
+  | { kind: 'sniff'; gzip: boolean };
+
+const LEGACY_SPREADSHEET = new Set(['xls', 'xlsb', 'numbers', 'ods']);
+
+function planFor(fileName: string): LoadPlan {
+  const lower = fileName.toLowerCase();
+  const gzip = lower.endsWith('.gz');
+  const inner = gzip ? lower.slice(0, -3) : lower;
+  const ext = inner.match(/\.([^.]+)$/)?.[1] ?? '';
   switch (ext) {
-    case 'csv': case 'tsv': case 'txt': return 'read_csv_auto';
-    case 'parquet': return 'read_parquet';
-    case 'json': case 'jsonl': case 'ndjson': return 'read_json_auto';
+    case 'csv': case 'tsv': case 'txt':
+      return { kind: 'reader', reader: 'read_csv_auto', gzip };
+    case 'json': case 'jsonl': case 'ndjson':
+      return { kind: 'reader', reader: 'read_json_auto', gzip };
+    case 'parquet':
+      if (gzip) throw new Error('Gzipped Parquet is not supported; Parquet files carry their own compression.');
+      return { kind: 'reader', reader: 'read_parquet', gzip: false };
+    case 'xlsx': case 'xlsm':
+      if (gzip) throw new Error('Gzipped Excel files are not supported; unpack the .gz first.');
+      return { kind: 'workbook' };
     default:
-      throw new Error(
-        `Unsupported file type ".${ext}". Supported: .csv, .tsv, .txt, .parquet, .json, .jsonl, .ndjson`,
-      );
+      if (LEGACY_SPREADSHEET.has(ext)) {
+        throw new Error(
+          `.${ext} spreadsheets are not supported. In your spreadsheet app, save or export the file as .xlsx or .csv and add that instead.`,
+        );
+      }
+      return { kind: 'sniff', gzip };
   }
 }
 
-/** Registers a browser File, loads it into a new table, profiles and remembers it. */
-export async function addFile(file: File): Promise<TableProfile> {
-  const reader = readerFor(file.name); // throws early for unsupported types
-  const db = await getDb();
-  const conn = await getConn();
+/** Throws when a reader needs an extension that failed to load at startup. */
+function requireExtension(reader: Reader): void {
   const needs = reader === 'read_parquet' ? 'parquet' : reader === 'read_json_auto' ? 'json' : null;
   const missing = needs ? extensionErrors.get(needs) : undefined;
   if (needs && missing) {
@@ -223,21 +273,170 @@ export async function addFile(file: File): Promise<TableProfile> {
         `extensions.duckdb.org when the page loaded (${missing}). Reload the page to try again.`,
     );
   }
+}
+
+/** `reader('name'[, options])` for a registered file. */
+function readExpr(reader: Reader, registeredName: string, options: string[] = []): string {
+  return `${reader}(${[quoteLiteral(registeredName), ...options].join(', ')})`;
+}
+
+async function createTable(table: string, fromExpr: string): Promise<void> {
+  const conn = await getConn();
+  await conn.query(`CREATE TABLE ${quoteIdent(table)} AS SELECT * FROM ${fromExpr}`);
+}
+
+async function dropTable(table: string): Promise<void> {
+  const conn = await getConn();
+  await conn.query(`DROP TABLE IF EXISTS ${quoteIdent(table)}`).catch(() => null);
+}
+
+/** Unknown extension: CSV first, then JSON; the first failure is what the user sees. */
+async function createTableSniffing(
+  table: string,
+  registeredName: string,
+  fileName: string,
+  gzip: boolean,
+): Promise<void> {
+  const options = gzip ? ["compression='gzip'"] : [];
+  let firstError: unknown;
+  try {
+    await createTable(table, readExpr('read_csv_auto', registeredName, options));
+    return;
+  } catch (err) {
+    firstError = err;
+  }
+  await dropTable(table);
+  if (!extensionErrors.has('json')) {
+    try {
+      await createTable(table, readExpr('read_json_auto', registeredName, options));
+      return;
+    } catch {
+      await dropTable(table);
+    }
+  }
+  const reason = firstError instanceof Error ? firstError.message : String(firstError);
+  throw new Error(`Could not read ${fileName} as CSV or JSON: ${reason}`);
+}
+
+/**
+ * Registers a browser File and loads it into new tables, which are profiled
+ * and remembered. Returns every table the file produced: one per non-empty
+ * sheet for an Excel workbook, one for anything else. Supported: CSV/TSV/TXT,
+ * Parquet, JSON/JSONL/NDJSON (each also gzipped), .xlsx/.xlsm; any other
+ * extension is sniffed as CSV, then JSON.
+ */
+export async function addFile(file: File): Promise<TableProfile[]> {
+  const plan = planFor(file.name); // throws early for types we know we cannot read
+  if (plan.kind === 'workbook') return addWorkbook(file);
+  if (plan.kind === 'reader') requireExtension(plan.reader);
+  const db = await getDb();
+  await getConn();
   const table = tableNameFor(file.name);
   const registeredName = `${UPLOAD_PREFIX}${table}__${file.name}`;
   await db.registerFileHandle(registeredName, file, duckdb.DuckDBDataProtocol.BROWSER_FILEREADER, true);
   try {
-    await conn.query(
-      `CREATE TABLE ${quoteIdent(table)} AS SELECT * FROM ${reader}(${quoteLiteral(registeredName)})`,
-    );
+    if (plan.kind === 'reader') {
+      const options = plan.gzip ? ["compression='gzip'"] : [];
+      await createTable(table, readExpr(plan.reader, registeredName, options));
+    } else {
+      await createTableSniffing(table, registeredName, file.name, plan.gzip);
+    }
     const profile = await profileTable(table, file.name);
     tables.set(table, { fileName: file.name, registeredName, profile, file });
-    return profile;
+    return [profile];
   } catch (err) {
-    await conn.query(`DROP TABLE IF EXISTS ${quoteIdent(table)}`).catch(() => null);
+    await dropTable(table);
     await db.dropFile(registeredName).catch(() => null);
     throw err;
   }
+}
+
+/** Part of a registered file name derived from a sheet name; keeps the virtual path tidy. */
+function safeSheetName(name: string): string {
+  return name.replace(/[^A-Za-z0-9_.-]+/g, '_') || 'sheet';
+}
+
+/**
+ * Converts each non-empty sheet of an .xlsx/.xlsm workbook to CSV text and
+ * loads it as its own table. A single-sheet workbook is named after the file;
+ * with several sheets each table is `<file>_<sheet>`.
+ */
+async function addWorkbook(file: File): Promise<TableProfile[]> {
+  const db = await getDb();
+  await getConn();
+  const sheets = (await xlsxToSheets(file)).filter((s) => s.rowCount > 0);
+  if (sheets.length === 0) throw new Error('The workbook has no data');
+  const single = sheets.length === 1;
+  const base = baseName(file.name);
+  const created: { table: string; registeredName: string }[] = [];
+  const profiles: TableProfile[] = [];
+  try {
+    for (const sheet of sheets) {
+      const table = uniqueTableName(sanitizeName(single ? base : `${base}_${sheet.name}`));
+      const registeredName = `${UPLOAD_PREFIX}${table}__${safeSheetName(sheet.name)}.csv`;
+      const fileName = single ? file.name : `${file.name} · ${sheet.name}`;
+      await db.registerFileText(registeredName, sheet.csv);
+      created.push({ table, registeredName });
+      await createTable(table, readExpr('read_csv_auto', registeredName, ['header=true']));
+      const profile = await profileTable(table, fileName);
+      tables.set(table, { fileName, registeredName, profile, file });
+      profiles.push(profile);
+    }
+    return profiles;
+  } catch (err) {
+    for (const { table, registeredName } of created) {
+      tables.delete(table);
+      await dropTable(table);
+      await db.dropFile(registeredName).catch(() => null);
+    }
+    throw err;
+  }
+}
+
+/**
+ * Loads pasted delimited text (tab, comma, semicolon or pipe separated; first
+ * row is the header) as a table named after `name`, made unique like a file
+ * name would be. The text is kept as a File so engine restarts can replay it.
+ */
+export async function addText(name: string, text: string): Promise<TableProfile[]> {
+  const db = await getDb();
+  await getConn();
+  const table = uniqueTableName(sanitizeName(name));
+  const registeredName = `${UPLOAD_PREFIX}${table}__pasted.txt`;
+  const file = new File([text], `${name}.txt`, { type: 'text/plain' });
+  await db.registerFileText(registeredName, text);
+  try {
+    await createTable(table, readExpr('read_csv_auto', registeredName, ['header=true']));
+    const profile = await profileTable(table, file.name);
+    tables.set(table, { fileName: file.name, registeredName, profile, file, pastedAs: name });
+    return [profile];
+  } catch (err) {
+    await dropTable(table);
+    await db.dropFile(registeredName).catch(() => null);
+    throw err;
+  }
+}
+
+const DELIMITERS = ['\t', ',', ';', '|'];
+
+/**
+ * Cheap check used to decide whether pasted text is a table: at least two
+ * non-empty lines, and the first five all contain the same delimiter. Tab-
+ * separated input must also have the same number of fields on every line.
+ */
+export function looksTabular(text: string): boolean {
+  const lines = text.split(/\r?\n/).filter((l) => l.trim() !== '');
+  if (lines.length < 2) return false;
+  const sample = lines.slice(0, 5);
+  for (const d of DELIMITERS) {
+    if (!sample.every((l) => l.includes(d))) continue;
+    if (d === '\t') {
+      const counts = sample.map((l) => l.split('\t').length);
+      if (!counts.every((c) => c === counts[0])) continue;
+    }
+    return true;
+  }
+  return false;
 }
 
 /** Drops a loaded table and its registered file. Unknown names are ignored. */

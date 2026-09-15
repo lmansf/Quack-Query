@@ -47,9 +47,14 @@ A small Vite plugin in `vite.config.ts` serves `api/*.ts` at `/api/*` during `np
 
 Deploy to [Vercel](https://vercel.com). It auto-detects the Vite app and the `api/` directory as serverless functions. In the project settings, add `GROQ_API_KEY` (and `LLM_PROVIDER=groq`), or `ANTHROPIC_API_KEY` for Anthropic.
 
-## Supported formats
+## Supported inputs
 
-CSV / TSV / delimited text (`.csv`, `.tsv`, `.txt`), Parquet (`.parquet`), and JSON (`.json`, `.jsonl`, `.ndjson`).
+Drop or pick files, or paste cells straight from a spreadsheet. Everything table-shaped becomes a table:
+
+- CSV / TSV / any delimited text (`.csv`, `.tsv`, `.txt`, and unknown extensions, which DuckDB sniffs), optionally gzipped (`.csv.gz`).
+- Excel workbooks (`.xlsx`, `.xlsm`): each non-empty sheet becomes its own table, named `<file>_<sheet>` when a workbook has several. Dates and times are converted from Excel serials; the reader is built in (no library, no network). Legacy `.xls` and `.xlsb` must be saved as `.xlsx` or CSV first.
+- Parquet (`.parquet`) and JSON (`.json`, `.jsonl`, `.ndjson`), optionally gzipped for JSON.
+- Pasted rows (tab, comma, semicolon, or pipe separated, first row as header) via Ctrl/Cmd+V anywhere on the page or the "Paste data" panel; they become `pasted`, `pasted_2`, and so on.
 
 ## Security model
 
