@@ -1409,7 +1409,7 @@ function main(): void {
       try {
         count = await countQuery(sql);
       } catch {
-        count = undefined; // not a subquery-able statement; the preview falls back to a plain run
+        count = undefined; // the preview runs the same wrapper and reports the error
       }
       if (count !== undefined && !confirmLargeResult(question, sql, count, response)) return;
 
