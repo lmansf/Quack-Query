@@ -38,8 +38,10 @@ export function cleanSql(raw: string): string {
  * deployment's Content-Security-Policy) is what keeps data in the tab.
  */
 // A scheme is a run of these characters starting with a letter. The match only starts
-// where such a run starts, which keeps it linear on long runs without "://".
-const URL_RE = /(?<![a-z0-9+.-])[0-9+.-]*[a-z][a-z0-9+.-]*:\/\//i;
+// where such a run starts (at the beginning or after another character), which keeps it
+// linear on long runs without "://". No lookbehind: older Safari versions cannot parse one,
+// and this module is part of the browser bundle.
+const URL_RE = /(?:^|[^a-z0-9+.-])[0-9+.-]*[a-z][a-z0-9+.-]*:\/\//i;
 
 /** Patterns for calls of some functions, by name. */
 interface CallPatterns {
