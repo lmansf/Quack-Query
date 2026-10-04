@@ -259,3 +259,90 @@ export interface ResultsResponse {
   /** Most recent comments first, at most 50 (always across all sources). */
   comments: { variant: Variant; source: ResponseSource; comment: string; at: string }[];
 }
+
+// ---------------------------------------------------------------------------
+// Variant B: Jev column mapping + iterative query loop
+// ---------------------------------------------------------------------------
+
+/** Queries the loop may run before it must name the final query. */
+export const LOOP_MAX_QUERIES = 5;
+/** Rows of each loop query shown to the model (only when values may be sent). */
+export const LOOP_SAMPLE_ROWS = 20;
+/** Columns and characters per cell of each loop query shown to the model. */
+export const LOOP_MAX_COLUMNS = 30;
+export const LOOP_CELL_CHARS = 200;
+/** Top level of Jev's column-count rubric; the last level means "this many or more". */
+export const MAPPING_MAX_COLUMNS = 8;
+
+/** POST /api/mapping body (same shape as QueryRequest). */
+export interface MappingRequest {
+  dataset: DatasetProfile;
+  question: string;
+}
+
+/** One column Jev picked for a slot. */
+export interface PredictedColumn {
+  table: string;
+  column: string;
+  /** Jev's probability for this column in its slot (0-1). */
+  probability: number;
+}
+
+/** POST /api/mapping success body. */
+export interface MappingResponse {
+  /** Predicted number of columns the SQL must reference (1..MAPPING_MAX_COLUMNS): the most probable rubric level. */
+  k: number;
+  /** Jev's expected count (may be fractional). */
+  expectedCount: number;
+  /** Probability of each count; index 0 = 1 column. */
+  countProbabilities: number[];
+  /** One column per slot in prediction order (fewer than k only when the schema has fewer columns). */
+  columns: PredictedColumn[];
+  /** Jev model id reported by the API. */
+  model: string;
+  /** Jev API calls made: 1 count call + one per slot. */
+  calls: number;
+}
+
+/** What the model saw from one query it ran in the loop. */
+export interface LoopAttempt {
+  sql: string;
+  /** "refused": the SQL failed the read-only / external-access checks and was not run. */
+  outcome: "ok" | "error" | "refused";
+  columns?: string[];
+  /** DuckDB type names, parallel to `columns`. */
+  types?: string[];
+  rowCount?: number;
+  /** First LOOP_SAMPLE_ROWS rows as display strings; omitted in shape-only mode. */
+  rows?: string[][];
+  /** DuckDB error text or the refusal reason. */
+  error?: string;
+}
+
+/** POST /api/step body: one turn of the loop. */
+export interface StepRequest {
+  dataset: DatasetProfile;
+  question: string;
+  mapping: MappingResponse;
+  /** Queries already run, oldest first (at most LOOP_MAX_QUERIES). */
+  attempts: LoopAttempt[];
+  /** Queries the model may still run (0..LOOP_MAX_QUERIES); at 0 it must give the final query. */
+  remaining: number;
+  /** True when the user turned off sending result values: attempts carry shape and errors only. */
+  shapeOnly: boolean;
+}
+
+/** POST /api/step success body. */
+export interface StepResponse {
+  /**
+   * "query": run this SQL and report the result in the next turn.
+   * "final": the query whose result answers the question; it may repeat an
+   * earlier attempt or be new (a new final runs once more, outside the budget).
+   */
+  action: "query" | "final";
+  sql: string;
+  /** Model that served the turn. */
+  model?: string;
+  /** Set when the SQL failed the server's read-only / external-access checks. */
+  refused?: string;
+}

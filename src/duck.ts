@@ -10,16 +10,20 @@ import mvpWasm from '@duckdb/duckdb-wasm/dist/duckdb-mvp.wasm?url';
 import mvpWorker from '@duckdb/duckdb-wasm/dist/duckdb-browser-mvp.worker.js?url';
 import ehWasm from '@duckdb/duckdb-wasm/dist/duckdb-eh.wasm?url';
 import ehWorker from '@duckdb/duckdb-wasm/dist/duckdb-browser-eh.worker.js?url';
-import { DataType, type Field, type Table as ArrowTable } from 'apache-arrow';
+import { DataType, Precision, TimeUnit, type Field, type Table as ArrowTable } from 'apache-arrow';
 import { LOW_CARDINALITY_LIMIT, MAX_OVERLAP_PAIRS, MIN_OVERLAP_FRACTION } from '../shared/types';
 import type { ColumnProfile, DatasetProfile, RelationshipHint, TableProfile } from '../shared/types';
+import { formatValue } from './format';
 import { xlsxToSheets } from './xlsx';
 
 export { isReadOnlySql } from '../shared/sql';
+export { formatValue };
 
 /** Result of `runQuery`: column names plus rows in column order. */
 export interface QueryResult {
   columns: string[];
+  /** DuckDB type names (VARCHAR, BIGINT, DECIMAL(10,2), ...), parallel to `columns`. */
+  types: string[];
   rows: unknown[][];
   /** Real number of rows the query produced (before truncation). */
   rowCount: number;
@@ -866,6 +870,52 @@ function cellConverter(field: Field): (v: unknown) => unknown {
   return toPlain;
 }
 
+/** A struct field name as DuckDB prints it inside a type name (quoted unless a plain identifier). */
+function typeFieldName(name: string): string {
+  return /^[A-Za-z_][A-Za-z0-9_]*$/.test(name) ? name : quoteIdent(name);
+}
+
+/**
+ * DuckDB's name for a result column's Arrow type as DuckDB-Wasm exports it
+ * (BIGINT, DOUBLE, DECIMAL(10,2), TIMESTAMP, VARCHAR[], STRUCT(a INTEGER)...),
+ * falling back to Arrow's own name for types without an obvious counterpart.
+ * Uses the typeId-based `DataType.is*` checks, which work across Arrow copies.
+ */
+function duckTypeName(t: DataType): string {
+  if (DataType.isNull(t)) return 'NULL';
+  if (DataType.isBool(t)) return 'BOOLEAN';
+  if (DataType.isInt(t)) {
+    const base = t.bitWidth === 8 ? 'TINYINT' : t.bitWidth === 16 ? 'SMALLINT' : t.bitWidth === 32 ? 'INTEGER' : 'BIGINT';
+    return t.isSigned ? base : `U${base}`;
+  }
+  if (DataType.isFloat(t)) {
+    if (t.precision === Precision.SINGLE) return 'FLOAT';
+    if (t.precision === Precision.DOUBLE) return 'DOUBLE';
+  }
+  if (DataType.isDecimal(t)) return `DECIMAL(${t.precision},${t.scale})`;
+  if (DataType.isUtf8(t) || DataType.isLargeUtf8(t)) return 'VARCHAR';
+  if (DataType.isBinary(t) || DataType.isLargeBinary(t) || DataType.isFixedSizeBinary(t)) return 'BLOB';
+  if (DataType.isDate(t)) return 'DATE';
+  if (DataType.isTime(t)) return 'TIME';
+  if (DataType.isTimestamp(t)) {
+    if (t.timezone) return 'TIMESTAMP WITH TIME ZONE';
+    if (t.unit === TimeUnit.SECOND) return 'TIMESTAMP_S';
+    if (t.unit === TimeUnit.MILLISECOND) return 'TIMESTAMP_MS';
+    if (t.unit === TimeUnit.NANOSECOND) return 'TIMESTAMP_NS';
+    return 'TIMESTAMP';
+  }
+  if (DataType.isInterval(t) || DataType.isDuration(t)) return 'INTERVAL';
+  // DuckDB exports ENUM columns as dictionaries of strings.
+  if (DataType.isDictionary(t)) return duckTypeName(t.dictionary);
+  if (DataType.isList(t)) return `${duckTypeName(t.valueType)}[]`;
+  if (DataType.isFixedSizeList(t)) return `${duckTypeName(t.valueType)}[${t.listSize}]`;
+  if (DataType.isMap(t)) return `MAP(${duckTypeName(t.keyType)}, ${duckTypeName(t.valueType)})`;
+  if (DataType.isStruct(t)) {
+    return `STRUCT(${t.children.map((f) => `${typeFieldName(f.name)} ${duckTypeName(f.type)}`).join(', ')})`;
+  }
+  return String(t);
+}
+
 /** Converts Arrow row/vector wrappers (which expose toJSON) into plain values. */
 function toPlain(v: unknown): unknown {
   if (v === null || v === undefined) return v;
@@ -888,6 +938,7 @@ export async function runQuery(sql: string, maxRows = 500): Promise<QueryResult>
   const conn = await getConn();
   const table = await queryWithTimeout(conn, sql, QUERY_TIMEOUT_MS);
   const columns = table.schema.fields.map((f) => f.name);
+  const types = table.schema.fields.map((f) => duckTypeName(f.type));
   const rowCount = table.numRows;
   const limit = Math.min(rowCount, maxRows);
   const vectors = columns.map((_, i) => table.getChildAt(i));
@@ -896,7 +947,7 @@ export async function runQuery(sql: string, maxRows = 500): Promise<QueryResult>
   for (let r = 0; r < limit; r++) {
     rows.push(vectors.map((vec, i) => converters[i](vec ? vec.get(r) : null)));
   }
-  return { columns, rows, rowCount, truncated: rowCount > limit };
+  return { columns, types, rows, rowCount, truncated: rowCount > limit };
 }
 
 // ---------------------------------------------------------------------------
@@ -981,27 +1032,9 @@ export async function runQueryPreview(
   }
   return {
     columns: preview.columns,
+    types: preview.types,
     rows: preview.rows.slice(0, maxRows),
     rowCount,
     truncated: rowCount > maxRows,
   };
-}
-
-/** Human-readable string for any cell value (used for profiles and display). */
-export function formatValue(v: unknown): string {
-  if (v === null || v === undefined) return 'NULL';
-  if (typeof v === 'string') return v;
-  if (typeof v === 'bigint') return v.toString();
-  if (typeof v === 'boolean') return String(v);
-  // Strip binary floating-point noise (668.3399999999999 -> 668.34) while keeping 15 significant digits.
-  if (typeof v === 'number') return Number.isFinite(v) ? String(Number(v.toPrecision(15))) : String(v);
-  if (v instanceof Date) return v.toISOString();
-  if (v instanceof Uint8Array) {
-    return Array.from(v, (b) => b.toString(16).padStart(2, '0')).join('');
-  }
-  try {
-    return JSON.stringify(v, (_k, val: unknown) => (typeof val === 'bigint' ? val.toString() : val));
-  } catch {
-    return String(v);
-  }
 }

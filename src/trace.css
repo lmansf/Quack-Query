@@ -1,0 +1,118 @@
+/* "How this answer was found": step list of the query loop (variant B).
+   The heading picks up the shared `section > h2` style from style.css. */
+.trace {
+  /* Spans the SQL + results columns when placed inside the .output grid. */
+  grid-column: 1 / -1;
+  min-width: 0;
+  padding: 12px 16px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.output > .trace { margin-bottom: 0; }
+
+.trace > h2 { margin: 0 0 8px; }
+
+.trace-steps {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
+.trace-step {
+  --step-pad: 7px;
+  position: relative;
+  min-width: 0;
+  padding: var(--step-pad) 0 var(--step-pad) 22px;
+  border-top: 1px solid var(--border);
+  overflow-wrap: anywhere;
+}
+
+.trace-step:first-child { --step-pad: 0px; padding-bottom: 7px; border-top: 0; }
+.trace-step:last-child { padding-bottom: 0; }
+
+/* Status dot, centred on the first line of text. */
+.trace-step::before {
+  content: "";
+  position: absolute;
+  left: 4px;
+  top: calc(var(--step-pad) + 0.75em - 4px);
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--border);
+}
+
+.trace-step.is-done::before,
+.trace-step.is-ok::before { background: var(--accent); }
+.trace-step.is-error::before,
+.trace-step.is-failed::before { background: var(--error-fg); }
+.trace-step.is-refused::before { background: var(--card); box-shadow: inset 0 0 0 2px var(--error-fg); }
+.trace-step.is-final::before { background: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+
+.trace-step.is-pending { color: var(--muted); }
+.trace-step.is-pending::before {
+  background: var(--accent);
+  animation: trace-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes trace-pulse {
+  0%, 100% { opacity: 0.25; }
+  50% { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .trace-step.is-pending::before { animation: none; opacity: 0.6; }
+}
+
+.trace-step strong { font-weight: 600; }
+
+/* Query label on the left, "Queries remaining" on the right (wraps under on narrow screens). */
+.trace-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0 12px;
+}
+
+.trace-label { min-width: 0; }
+
+.trace-meta {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 0.82rem;
+  white-space: nowrap;
+}
+
+.trace-col {
+  font-family: var(--mono);
+  font-size: 0.86em;
+}
+
+.trace-step.is-error .trace-outcome,
+.trace-step.is-refused .trace-outcome,
+.trace-step.is-fallback .trace-outcome,
+.trace-step.is-failed .trace-outcome { color: var(--error-fg); }
+
+/* The query, on one line; the full SQL is in the tooltip. */
+.trace-sql {
+  display: block;
+  margin-top: 3px;
+  padding: 1px 8px;
+  font: 0.8rem/1.6 var(--mono);
+  color: var(--fg);
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+@media (max-width: 480px) {
+  .trace { padding: 10px 12px; }
+  .trace-meta { margin-left: 0; }
+}
