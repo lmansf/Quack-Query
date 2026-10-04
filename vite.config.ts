@@ -46,7 +46,7 @@ function pickHandler(mod: Record<string, unknown>, method: string): ApiHandler |
  */
 function localApi(mode: string): Plugin {
   // Load provider settings from .env files once, so api/ modules can read process.env.
-  const env = loadEnv(mode, process.cwd(), ["LLM_", "GROQ_", "ANTHROPIC_"]);
+  const env = loadEnv(mode, process.cwd(), ["LLM_", "GROQ_", "ANTHROPIC_", "TYPESAFE_"]);
   for (const [key, value] of Object.entries(env)) {
     if (process.env[key] === undefined) process.env[key] = value;
   }
