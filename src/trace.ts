@@ -121,9 +121,11 @@ function finalStep(p: Extract<LoopProgress, { kind: "final" }>): HTMLLIElement {
     label.append(p.reusedAttempt === null ? "new, run once more" : `same as query ${p.reusedAttempt}`);
     return step("is-final", label);
   }
-  label.append(el("span", { className: "trace-outcome", text: `refused: ${preview(p.refused)}`, title: p.refused }));
-  if (p.reusedAttempt !== null) label.append(` · using query ${p.reusedAttempt} instead`);
-  return step(p.reusedAttempt === null ? "is-refused" : "is-final is-fallback", label);
+  label.append(
+    el("span", { className: "trace-outcome", text: `refused: ${preview(p.refused)}`, title: p.refused }),
+    " (not run)",
+  );
+  return step("is-refused", label);
 }
 
 export function createTrace(): Trace {
@@ -173,6 +175,9 @@ export function createTrace(): Trace {
         break;
       case "step-start":
         tailRow = step("is-pending", `Thinking… (queries remaining: ${remainingText(p.remaining)})`);
+        break;
+      case "attempt-start":
+        tailRow = step("is-pending", `Running query ${p.index} in your browser…`);
         break;
       case "attempt-done":
         queryRows.set(p.index, queryStep(p.index, p.attempt, p.remainingAfter));

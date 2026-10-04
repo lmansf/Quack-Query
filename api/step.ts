@@ -7,10 +7,12 @@
  */
 import {
   LOOP_CELL_CHARS,
+  LOOP_ERROR_CHARS,
   LOOP_MAX_COLUMNS,
   LOOP_MAX_QUERIES,
   LOOP_SAMPLE_ROWS,
   MAPPING_MAX_COLUMNS,
+  type DatasetProfile,
   type LoopAttempt,
   type MappingResponse,
   type PredictedColumn,
@@ -19,7 +21,7 @@ import {
   type StepResponse,
 } from "../shared/types.js";
 import { cleanSql, externalReference, isReadOnlySql } from "../shared/sql.js";
-import { buildLoopSystemPrompt, buildLoopUserMessage, parseStepReply } from "../shared/loop.js";
+import { buildLoopSystemPrompt, buildLoopUserMessage, hideDataNames, loopErrorText, parseStepReply } from "../shared/loop.js";
 import { ProviderError, type ProviderResult } from "./_providers/types.js";
 import { MAX_PROMPT_CHARS, MAX_STRING, finiteNumber, isRecord, validateQueryLike } from "./_providers/dataset.js";
 import { selectProvider } from "./_providers/select.js";
@@ -27,7 +29,6 @@ import { jsonResponse } from "./_providers/http.js";
 import { guardRequest, readJsonBody } from "./_providers/guard.js";
 
 const MAX_SQL_LENGTH = 20_000;
-const MAX_ERROR_LENGTH = 2000;
 const MAX_MODEL_LENGTH = 100;
 const RETRY_NUDGE = "Your previous reply was not a JSON object of the required form. Reply with only the JSON object.";
 
@@ -71,8 +72,12 @@ function validateMapping(v: unknown): MappingResponse | string {
   return { k, expectedCount, countProbabilities, columns: cleanColumns, model, calls };
 }
 
-/** Rebuilds one attempt from untrusted input; rows are dropped in shape-only mode and cells capped. */
-function validateAttempt(v: unknown, at: string, shapeOnly: boolean): LoopAttempt | string {
+/**
+ * Rebuilds one attempt from untrusted input; cells are capped and errors clipped. In
+ * shape-only mode rows are dropped, and error values and data-derived column names are
+ * masked again here (the browser already does both), so no value reaches the model.
+ */
+function validateAttempt(v: unknown, at: string, shapeOnly: boolean, dataset: DatasetProfile): LoopAttempt | string {
   if (!isRecord(v)) return `${at} must be an object`;
   const { sql, outcome } = v;
   if (typeof sql !== "string" || sql.length > MAX_SQL_LENGTH) return `${at}.sql must be a string of at most ${MAX_SQL_LENGTH} characters`;
@@ -83,7 +88,7 @@ function validateAttempt(v: unknown, at: string, shapeOnly: boolean): LoopAttemp
   if (present(v.columns)) {
     const columns = stringList(v.columns, LOOP_MAX_COLUMNS);
     if (!columns) return `${at}.columns must be an array of at most ${LOOP_MAX_COLUMNS} strings of at most ${MAX_STRING} characters`;
-    attempt.columns = columns;
+    attempt.columns = shapeOnly ? hideDataNames(columns, sql, dataset) : columns;
   }
   if (present(v.types)) {
     const types = stringList(v.types, LOOP_MAX_COLUMNS);
@@ -106,8 +111,9 @@ function validateAttempt(v: unknown, at: string, shapeOnly: boolean): LoopAttemp
     if (!shapeOnly) attempt.rows = rows;
   }
   if (present(v.error)) {
-    if (typeof v.error !== "string" || v.error.length > MAX_ERROR_LENGTH) return `${at}.error must be a string of at most ${MAX_ERROR_LENGTH} characters`;
-    attempt.error = v.error;
+    if (typeof v.error !== "string") return `${at}.error must be a string`;
+    // Refusal reasons come from the checks, not from the data.
+    attempt.error = outcome === "error" ? loopErrorText(v.error, shapeOnly) : v.error.slice(0, LOOP_ERROR_CHARS);
   }
   return attempt;
 }
@@ -125,7 +131,7 @@ function validate(body: unknown): StepRequest | string {
   }
   const cleanAttempts: LoopAttempt[] = [];
   for (const [i, attempt] of attempts.entries()) {
-    const parsed = validateAttempt(attempt, `\`attempts[${i}]\``, shapeOnly);
+    const parsed = validateAttempt(attempt, `\`attempts[${i}]\``, shapeOnly, base.dataset);
     if (typeof parsed === "string") return parsed;
     cleanAttempts.push(parsed);
   }

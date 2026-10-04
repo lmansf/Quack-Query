@@ -271,6 +271,14 @@ export const LOOP_SAMPLE_ROWS = 20;
 /** Columns and characters per cell of each loop query shown to the model. */
 export const LOOP_MAX_COLUMNS = 30;
 export const LOOP_CELL_CHARS = 200;
+/** Characters of a loop query's error message shown to the model. */
+export const LOOP_ERROR_CHARS = 1000;
+/**
+ * Characters of sample rows (all attempts together) one loop step may carry. The
+ * oldest attempts lose their rows first, so requests stay well under the server's
+ * prompt and body limits.
+ */
+export const LOOP_ROWS_BUDGET_CHARS = 60_000;
 /** Top level of Jev's column-count rubric; the last level means "this many or more". */
 export const MAPPING_MAX_COLUMNS = 8;
 
@@ -309,13 +317,17 @@ export interface LoopAttempt {
   sql: string;
   /** "refused": the SQL failed the read-only / external-access checks and was not run. */
   outcome: "ok" | "error" | "refused";
+  /** Result column names; in shape-only mode, names that could come from the data are hidden. */
   columns?: string[];
   /** DuckDB type names, parallel to `columns`. */
   types?: string[];
   rowCount?: number;
-  /** First LOOP_SAMPLE_ROWS rows as display strings; omitted in shape-only mode. */
+  /**
+   * First LOOP_SAMPLE_ROWS rows as display strings. Omitted in shape-only mode, and
+   * dropped from older attempts when the step would exceed LOOP_ROWS_BUDGET_CHARS.
+   */
   rows?: string[][];
-  /** DuckDB error text or the refusal reason. */
+  /** DuckDB error text (at most LOOP_ERROR_CHARS; values masked in shape-only mode) or the refusal reason. */
   error?: string;
 }
 

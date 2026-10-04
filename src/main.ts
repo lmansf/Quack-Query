@@ -366,8 +366,8 @@ function renderShell(root: HTMLElement): Shell {
         "classifier, which predicts the columns the query needs, and to the model. Queries run in your " +
         "browser; the model sees each result's shape and, while result rows are shared, the first " +
         `${LOOP_SAMPLE_ROWS} rows of each query and the first ${ANSWER_MAX_ROWS} for the written answer. ` +
-        "Ratings, optional comments, and outcome metrics (timing, row counts, error types, and the names " +
-        "of the predicted columns; never your questions, SQL, or data) are stored to compare versions of the app.",
+        "Ratings, optional comments, and outcome metrics (timing, row counts, error types, and the table and " +
+        "column names Jev predicted; never your questions, SQL, or data) are stored to compare versions of the app.",
     }),
   );
 
@@ -860,6 +860,9 @@ type LoopMetrics = Pick<
 
 /** Longest predicted-column name /api/event accepts ("table.column"). */
 const MAX_EVENT_COLUMN_CHARS = 200;
+/** Largest mapping time and table count /api/event accepts; larger values are clamped so the event is kept. */
+const MAX_EVENT_MAPPING_MS = 600_000;
+const MAX_EVENT_TABLES = 100;
 
 /**
  * Times one response (an Ask, an edited Run, or a history Load) from the user's action
@@ -917,7 +920,7 @@ function trackResponse(
         model: tracker.model,
         answerStep: ok && end.answerStep === true,
         answerMs: end.answerMs === undefined ? undefined : Math.max(0, Math.round(end.answerMs)),
-        tables: context.tables,
+        tables: Math.min(context.tables, MAX_EVENT_TABLES),
         ...tracker.loop,
       });
     },
@@ -1003,8 +1006,19 @@ function hideFeedback(container: HTMLElement): void {
 // API call
 // ---------------------------------------------------------------------------
 
+/** An API call that got a non-2xx response; `status` is the HTTP status. */
+class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
 /** Builds a user-facing message from a non-2xx API response (`{ error }` JSON or a platform error page). */
-async function errorFromResponse(res: Response): Promise<Error> {
+async function errorFromResponse(res: Response): Promise<ApiError> {
   let message = `Request failed (${res.status}${res.statusText ? " " + res.statusText : ""})`;
   const text = await res.text().catch(() => "");
   try {
@@ -1015,7 +1029,7 @@ async function errorFromResponse(res: Response): Promise<Error> {
     const excerpt = text.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 300);
     if (excerpt) message += `: ${excerpt}`;
   }
-  return new Error(message);
+  return new ApiError(message, res.status);
 }
 
 async function postJson(path: string, body: unknown): Promise<Response> {
@@ -1026,6 +1040,18 @@ async function postJson(path: string, body: unknown): Promise<Response> {
   });
   if (!res.ok) throw await errorFromResponse(res);
   return res;
+}
+
+/**
+ * Whether a failed question is Jev's failure (outcome "mapping_error"): /api/mapping
+ * answered with a server error (Jev unreachable, rejected, too slow, or not
+ * configured) or with no usable prediction. Rejected requests (400, 403, 413, 429)
+ * and network failures count as "api_error", as they would for A's /api/query.
+ */
+function isJevFailure(err: unknown): boolean {
+  if (!(err instanceof MappingError)) return false;
+  if (err.cause instanceof ApiError) return err.cause.status >= 500;
+  return err.cause === undefined;
 }
 
 /** Asks /api/mapping for Jev's prediction of the columns the question needs (runLoop checks the shape). */
@@ -1451,6 +1477,8 @@ function main(): void {
     const shareRows = ui.answerToggle.checked;
     const metrics: LoopMetrics = {};
     response.loop = metrics;
+    /** The final SQL once the loop names it, for history if presenting it fails. */
+    let finalSql: string | null = null;
 
     try {
       let outcome: LoopOutcome;
@@ -1470,10 +1498,12 @@ function main(): void {
                 metrics.predictedColumns = p.mapping.columns
                   .slice(0, MAX_PREDICTED_COLUMNS)
                   .map((c) => `${c.table}.${c.column}`.slice(0, MAX_EVENT_COLUMN_CHARS));
-                metrics.mappingMs = p.ms;
+                metrics.mappingMs = Math.min(p.ms, MAX_EVENT_MAPPING_MS);
                 metrics.attempts = 0;
               } else if (p.kind === "step-start") {
                 setStatus(`Asking the model… (queries remaining: ${p.remaining} of ${LOOP_MAX_QUERIES})`);
+              } else if (p.kind === "attempt-start") {
+                setStatus(`Running query ${p.index} in your browser…`);
               } else if (p.kind === "attempt-done") {
                 metrics.attempts = p.index;
               } else if (p.kind === "final" && p.reusedAttempt === null && p.refused === undefined) {
@@ -1488,10 +1518,11 @@ function main(): void {
         ui.trace.fail(message);
         setStatus("");
         showError(ui.error, message);
-        response.finish(err instanceof MappingError ? "mapping_error" : "api_error");
+        response.finish(isJevFailure(err) ? "mapping_error" : "api_error");
         return;
       }
 
+      finalSql = outcome.finalSql;
       response.model = outcome.model;
       lastModel = outcome.model;
       metrics.attempts = outcome.attempts.length;
@@ -1502,8 +1533,18 @@ function main(): void {
       showSql(outcome.finalSql);
 
       if (outcome.finalRefused !== undefined) {
+        // The same messages, and the same history entry for external references, as A's refusals.
+        const external = externalReference(outcome.finalSql);
         setStatus("");
-        showError(ui.error, `The final query was not run: ${outcome.finalRefused}.`);
+        if (external !== null) {
+          const message = `This query references ${external}, which is not allowed. Queries may only read the loaded tables.`;
+          showError(ui.error, message);
+          recordHistory({ question, sql: outcome.finalSql, source: "model", error: message });
+        } else if (!isReadOnlySql(outcome.finalSql)) {
+          showError(ui.error, "The generated SQL is not a read-only SELECT statement, so it was not run.");
+        } else {
+          showError(ui.error, `The final query was not run: ${outcome.finalRefused}.`);
+        }
         response.finish("refused");
         return;
       }
@@ -1522,6 +1563,7 @@ function main(): void {
       const message = `Query failed: ${errorMessage(err)}`;
       setStatus("");
       showError(ui.error, message);
+      if (finalSql !== null) recordHistory({ question, sql: finalSql, source: "model", error: message });
       response.finish("query_error");
     } finally {
       busy = false;
@@ -1535,6 +1577,7 @@ function main(): void {
     const sql = text.trim();
     if (!sql) return;
     const response = startResponse("edited");
+    ui.trace.reset(); // the result on screen is no longer the model's answer
     if (!isReadOnlySql(sql)) {
       setStatus("");
       showError(ui.error, "Only read-only SELECT statements can be run.");

@@ -11,6 +11,7 @@
 import {
   APIConnectionError,
   APIError,
+  APIUserAbortError,
   AuthenticationError,
   RateLimitError,
   TypeSafeClient,
@@ -41,6 +42,8 @@ const DESCRIPTION_VALUE_CHARS = 100;
 const STATE_MAX_CHARS = 60_000;
 /** Longest model id passed on (POST /api/step accepts at most 100 characters). */
 const MAX_MODEL_CHARS = 100;
+/** Time limit for one whole mapping (every Jev call and retry together). */
+const MAPPING_DEADLINE_MS = 25_000;
 
 const MISSING_KEY =
   "TYPESAFE_API_KEY is not set for this deployment (add it in the project's environment variables, Preview scope for variant B, and redeploy)";
@@ -271,6 +274,12 @@ function unexpected(what: string): ProviderError {
   return new ProviderError(502, `Jev returned an unexpected response: ${what}`);
 }
 
+/** One named answer of a System One result (the SDK returns the parsed JSON unchecked). */
+function answerOf(result: unknown, name: string): unknown {
+  if (!isRecord(result) || !isRecord(result.answers)) throw unexpected("no answers");
+  return result.answers[name];
+}
+
 /** Probabilities in rubric order (missing levels count as 0) and the expected score. */
 function readCount(answer: unknown): { probabilities: number[]; score: number } {
   if (!isRecord(answer) || !isRecord(answer.probabilities)) throw unexpected("the count answer has no probabilities");
@@ -329,8 +338,11 @@ function slotInstructions(k: number, slot: number, chosen: string[]): string {
 // Errors
 // ---------------------------------------------------------------------------
 
-function toProviderError(error: unknown): unknown {
+function toProviderError(error: unknown, deadline: AbortSignal): unknown {
   if (error instanceof ProviderError) return error;
+  if (deadline.aborted || error instanceof APIUserAbortError) {
+    return new ProviderError(504, `Jev did not finish predicting the columns within ${MAPPING_DEADLINE_MS / 1000} seconds`);
+  }
   if (error instanceof AuthenticationError) return new ProviderError(500, REJECTED_KEY);
   if (error instanceof RateLimitError) return new ProviderError(429, "Rate limited by Jev; please retry shortly");
   if (error instanceof APIError) {
@@ -390,6 +402,7 @@ function buildContext(dataset: DatasetProfile, question: string): Context {
  */
 export async function predictMapping(dataset: DatasetProfile, question: string): Promise<MappingResponse> {
   if (!process.env.TYPESAFE_API_KEY?.trim()) throw new ProviderError(500, MISSING_KEY);
+  const deadline = AbortSignal.timeout(MAPPING_DEADLINE_MS);
   try {
     // Created per request so configuration problems surface as JSON errors.
     // A long Retry-After from Jev falls back to the SDK's short backoff (an interactive request cannot wait a minute).
@@ -398,13 +411,13 @@ export async function predictMapping(dataset: DatasetProfile, question: string):
     const { candidates } = ctx;
 
     const countKeep = new Set(preRank(ctx, candidates, []).map((c) => c.index));
-    const counted = await client.systemOne({
-      state: buildState(ctx, countKeep),
-      questions: { count: score(COUNT_INSTRUCTIONS, COUNT_LEVELS) },
-    });
+    const counted = await client.systemOne(
+      { state: buildState(ctx, countKeep), questions: { count: score(COUNT_INSTRUCTIONS, COUNT_LEVELS) } },
+      { signal: deadline },
+    );
     let calls = 1;
     let model = typeof counted.model === "string" && counted.model.length > 0 ? counted.model : client.defaultModel;
-    const count = readCount(counted.answers.count);
+    const count = readCount(answerOf(counted, "count"));
     const k = Math.max(1, Math.min(argmax(count.probabilities) + 1, candidates.length));
 
     const chosen: Candidate[] = [];
@@ -423,13 +436,16 @@ export async function predictMapping(dataset: DatasetProfile, question: string):
         const chosenLabels = chosen.map((c) => c.label);
         const keep = new Set([...offered.map((c) => c.index), ...picked]);
         const criteria = Object.fromEntries(offered.map((c) => [c.label, c.description]));
-        const result = await client.systemOne({
-          state: buildState(ctx, keep, chosenLabels),
-          questions: { column: choice(slotInstructions(k, slot, chosenLabels), criteria) },
-        });
+        const result = await client.systemOne(
+          {
+            state: buildState(ctx, keep, chosenLabels),
+            questions: { column: choice(slotInstructions(k, slot, chosenLabels), criteria) },
+          },
+          { signal: deadline },
+        );
         calls++;
         if (typeof result.model === "string" && result.model.length > 0) model = result.model;
-        ({ pick, probability } = readChoice(result.answers.column, offered));
+        ({ pick, probability } = readChoice(answerOf(result, "column"), offered));
       }
       chosen.push(pick);
       picked.add(pick.index);
@@ -438,13 +454,14 @@ export async function predictMapping(dataset: DatasetProfile, question: string):
 
     return {
       k,
-      expectedCount: count.score + 1,
+      // Jev's score is 0-based over the rubric; like k, it cannot exceed the schema's column count.
+      expectedCount: Math.min(count.score + 1, candidates.length),
       countProbabilities: count.probabilities,
       columns,
       model: truncate(model, MAX_MODEL_CHARS),
       calls,
     };
   } catch (error) {
-    throw toProviderError(error);
+    throw toProviderError(error, deadline);
   }
 }

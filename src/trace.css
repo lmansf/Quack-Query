@@ -94,7 +94,6 @@
 
 .trace-step.is-error .trace-outcome,
 .trace-step.is-refused .trace-outcome,
-.trace-step.is-fallback .trace-outcome,
 .trace-step.is-failed .trace-outcome { color: var(--error-fg); }
 
 /* The query, on one line; the full SQL is in the tooltip. */

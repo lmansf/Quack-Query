@@ -8,11 +8,13 @@
  */
 import type { QueryResult } from "./duck";
 import { formatValue } from "./format";
+import { hideDataNames, loopErrorText } from "../shared/loop";
 import { externalReference, isReadOnlySql } from "../shared/sql";
 import {
   LOOP_CELL_CHARS,
   LOOP_MAX_COLUMNS,
   LOOP_MAX_QUERIES,
+  LOOP_ROWS_BUDGET_CHARS,
   LOOP_SAMPLE_ROWS,
   type DatasetProfile,
   type LoopAttempt,
@@ -39,14 +41,15 @@ export type LoopProgress =
   | { kind: "mapping-done"; mapping: MappingResponse; ms: number }
   /** The model is being asked for its next move. */
   | { kind: "step-start"; remaining: number; queriesRun: number }
+  /** The browser starts running query `index` (1-based). */
+  | { kind: "attempt-start"; index: number; sql: string }
   /** `index` is 1-based; `remainingAfter` is the budget left once this query is counted. */
   | { kind: "attempt-done"; index: number; attempt: LoopAttempt; remainingAfter: number }
   /**
    * The final query was chosen. `reusedAttempt` is the 1-based attempt whose
    * outcome is reused, or null when the SQL is new (it runs once more right
-   * after this event). `refused` is set when the model's final SQL failed the
-   * checks: then `sql` is the most recent ok attempt standing in for it
-   * (`reusedAttempt` set), or the refused SQL itself when there is none.
+   * after this event). `refused` is set when the final SQL failed the checks
+   * with no budget left to try again; it is not run.
    */
   | { kind: "final"; sql: string; reusedAttempt: number | null; refused?: string };
 
@@ -69,20 +72,22 @@ export class StepError extends Error {
 export interface LoopOutcome {
   mapping: MappingResponse;
   mappingMs: number;
-  /** Exactly what the model saw, oldest first. */
+  /**
+   * What the model was shown of each query, oldest first. Each step sends these,
+   * except that older attempts lose their sample rows when the step would exceed
+   * LOOP_ROWS_BUDGET_CHARS.
+   */
   attempts: LoopAttempt[];
   /** Full preview per attempt (null for errors and refusals). */
   attemptResults: (QueryResult | null)[];
-  /** The query to show: the model's final SQL, or the attempt standing in for a refused one. */
+  /** The model's final SQL. */
   finalSql: string;
   /** Null when the final query failed or was refused. */
   finalResult: QueryResult | null;
-  /** DuckDB error of the final query (from its own run, or from the attempt it repeats). */
+  /** DuckDB error of the final query (from its own run, or from the attempt it repeats), unmasked. */
   finalError?: string;
-  /** The final SQL failed the checks and no ok attempt existed to fall back to. */
+  /** The final SQL failed the checks with no budget left to try again, so it was not run. */
   finalRefused?: string;
-  /** The model's final SQL failed the checks and the most recent ok attempt stands in for it. */
-  fallbackFrom?: { sql: string; reason: string };
   /** True when the final SQL matched no attempt and was run once more (outside the budget). */
   finalWasNew: boolean;
   /** 1-based attempt whose outcome the final reuses, or null. */
@@ -122,6 +127,8 @@ export async function runLoop(
   // 2. The model runs queries until it names the final one or the budget is spent.
   const attempts: LoopAttempt[] = [];
   const attemptResults: (QueryResult | null)[] = [];
+  /** Each attempt's DuckDB error as raised (attempts carry the masked, clipped text the model saw). */
+  const rawErrors: (string | null)[] = [];
   let model: string | undefined;
   let step: StepResponse;
   for (;;) {
@@ -131,17 +138,28 @@ export async function runLoop(
       dataset,
       question,
       mapping,
-      attempts: attempts.slice(),
+      attempts: withinRowsBudget(attempts),
       remaining,
       shapeOnly,
     });
     if (step.model) model = step.model;
-    // A "query" with no budget left is treated as the final answer.
-    if (step.action !== "query" || remaining <= 0) break;
-    const { attempt, result } = await runAttempt(step, deps, shapeOnly);
-    attempts.push(attempt);
-    attemptResults.push(result);
-    emit({ kind: "attempt-done", index: attempts.length, attempt, remainingAfter: LOOP_MAX_QUERIES - attempts.length });
+    const refusal = refusalReason(step);
+    // A "query" with no budget left is treated as the final answer. A final query that
+    // fails the checks is reported back like a refused query while budget remains.
+    const final = step.action !== "query" || remaining <= 0;
+    if (final && (refusal === null || remaining <= 0)) break;
+    const index = attempts.length + 1;
+    let ran: { attempt: LoopAttempt; result: QueryResult | null; rawError: string | null };
+    if (refusal !== null) {
+      ran = { attempt: { sql: step.sql, outcome: "refused", error: refusal }, result: null, rawError: null };
+    } else {
+      emit({ kind: "attempt-start", index, sql: step.sql });
+      ran = await runAttempt(step.sql, deps, shapeOnly, dataset);
+    }
+    attempts.push(ran.attempt);
+    attemptResults.push(ran.result);
+    rawErrors.push(ran.rawError);
+    emit({ kind: "attempt-done", index, attempt: ran.attempt, remainingAfter: LOOP_MAX_QUERIES - attempts.length });
   }
 
   // 3. The final query: reuse an attempt's outcome when possible, otherwise run it once more.
@@ -149,32 +167,21 @@ export async function runLoop(
   const proposed = step.sql;
   const refusal = refusalReason(step);
   if (refusal !== null) {
-    const fallback = lastIndexWhere(attempts, (a) => a.outcome === "ok");
-    if (fallback < 0) {
-      emit({ kind: "final", sql: proposed, reusedAttempt: null, refused: refusal });
-      return { ...base, finalSql: proposed, finalResult: null, finalRefused: refusal, finalWasNew: false, reusedAttempt: null };
-    }
-    const sql = attempts[fallback].sql;
-    emit({ kind: "final", sql, reusedAttempt: fallback + 1, refused: refusal });
-    return {
-      ...base,
-      finalSql: sql,
-      finalResult: attemptResults[fallback],
-      fallbackFrom: { sql: proposed, reason: refusal },
-      finalWasNew: false,
-      reusedAttempt: fallback + 1,
-    };
+    // Only reached with no budget left: a refused final is otherwise reported back as an attempt.
+    emit({ kind: "final", sql: proposed, reusedAttempt: null, refused: refusal });
+    return { ...base, finalSql: proposed, finalResult: null, finalRefused: refusal, finalWasNew: false, reusedAttempt: null };
   }
 
   const same = matchingAttempt(attempts, proposed);
   if (same >= 0) {
     emit({ kind: "final", sql: proposed, reusedAttempt: same + 1 });
     const repeated = attempts[same];
+    const repeatedError = rawErrors[same] ?? repeated.error ?? "The query failed.";
     return {
       ...base,
       finalSql: proposed,
       finalResult: attemptResults[same],
-      ...(repeated.outcome === "error" ? { finalError: repeated.error ?? "The query failed." } : {}),
+      ...(repeated.outcome === "error" ? { finalError: repeatedError } : {}),
       finalWasNew: false,
       reusedAttempt: same + 1,
     };
@@ -204,21 +211,46 @@ async function requestStep(deps: LoopDeps, req: StepRequest): Promise<StepRespon
   return { ...res, sql: res.sql.trim() };
 }
 
-/** Runs one exploratory query, unless it fails the checks (then it is recorded as refused, unrun). */
+/** Runs one exploratory query that passed the checks and summarizes it for the model. */
 async function runAttempt(
-  step: StepResponse,
+  sql: string,
   deps: LoopDeps,
   shapeOnly: boolean,
-): Promise<{ attempt: LoopAttempt; result: QueryResult | null }> {
-  const refusal = refusalReason(step);
-  if (refusal !== null) return { attempt: { sql: step.sql, outcome: "refused", error: refusal }, result: null };
+  dataset: DatasetProfile,
+): Promise<{ attempt: LoopAttempt; result: QueryResult | null; rawError: string | null }> {
   let result: QueryResult;
   try {
-    result = await deps.runSql(step.sql);
+    result = await deps.runSql(sql);
   } catch (err) {
-    return { attempt: { sql: step.sql, outcome: "error", error: errorMessage(err) }, result: null };
+    const raw = errorMessage(err);
+    return { attempt: { sql, outcome: "error", error: loopErrorText(raw, shapeOnly) }, result: null, rawError: raw };
   }
-  return { attempt: summarizeAttempt(step.sql, result, shapeOnly), result };
+  return { attempt: summarizeAttempt(sql, result, shapeOnly, dataset), result, rawError: null };
+}
+
+/**
+ * Copies of the attempts whose sample rows fit LOOP_ROWS_BUDGET_CHARS together:
+ * the newest attempt keeps the most, and older attempts lose rows first (their
+ * shape and errors are always kept).
+ */
+function withinRowsBudget(attempts: LoopAttempt[]): LoopAttempt[] {
+  let left = LOOP_ROWS_BUDGET_CHARS;
+  const fitted = attempts.map((a) => ({ ...a }));
+  for (let i = fitted.length - 1; i >= 0; i--) {
+    const attempt = fitted[i];
+    if (!attempt?.rows) continue;
+    const kept: string[][] = [];
+    for (const row of attempt.rows) {
+      // Cells plus their separators, as the prompt lays them out.
+      const size = row.reduce((n, cell) => n + cell.length + 3, 0);
+      if (size > left) break;
+      left -= size;
+      kept.push(row);
+    }
+    if (kept.length > 0) attempt.rows = kept;
+    else delete attempt.rows;
+  }
+  return fitted;
 }
 
 /** Why the step's SQL must not run (server refusal, not read-only, external access), or null. */
@@ -255,14 +287,21 @@ const clip = (text: string): string => text.slice(0, LOOP_CELL_CHARS);
  * What the model sees of a successful query: its shape (columns, DuckDB types,
  * row count; at most LOOP_MAX_COLUMNS columns) plus, unless `shapeOnly`, the
  * first LOOP_SAMPLE_ROWS rows as display strings. Every name and cell is cut
- * to LOOP_CELL_CHARS characters.
+ * to LOOP_CELL_CHARS characters. In shape-only mode, column names that could
+ * come from the data (see hideDataNames) are hidden when `dataset` is given.
  */
-export function summarizeAttempt(sql: string, result: QueryResult, shapeOnly: boolean): LoopAttempt {
+export function summarizeAttempt(
+  sql: string,
+  result: QueryResult,
+  shapeOnly: boolean,
+  dataset?: DatasetProfile,
+): LoopAttempt {
   const width = Math.min(result.columns.length, LOOP_MAX_COLUMNS);
+  const names = result.columns.slice(0, width).map(clip);
   const attempt: LoopAttempt = {
     sql,
     outcome: "ok",
-    columns: result.columns.slice(0, width).map(clip),
+    columns: shapeOnly && dataset ? hideDataNames(names, sql, dataset) : names,
     types: result.types.slice(0, width).map(clip),
     rowCount: result.rowCount,
   };
@@ -300,10 +339,25 @@ function sqlTokens(sql: string): SqlToken[] {
 }
 
 /**
+ * SQL keywords that also make common column names. Bare, they are read as keywords
+ * (`EXTRACT(YEAR FROM …)`, `ORDER BY`), so they count as column references only
+ * when double-quoted, as the system prompt asks for every column.
+ */
+const KEYWORD_WORDS = new Set([
+  "all", "and", "any", "as", "asc", "between", "by", "case", "cast", "cross", "current", "date", "day", "desc",
+  "distinct", "else", "end", "except", "exists", "extract", "false", "filter", "first", "following", "from", "full",
+  "group", "having", "hour", "in", "inner", "intersect", "interval", "is", "join", "last", "left", "like", "ilike",
+  "limit", "minute", "month", "natural", "not", "null", "nulls", "offset", "on", "or", "order", "outer", "over",
+  "partition", "preceding", "qualify", "quarter", "range", "right", "row", "rows", "second", "select", "then", "time",
+  "timestamp", "true", "unbounded", "union", "using", "values", "week", "when", "where", "window", "with", "year",
+]);
+
+/**
  * Lower-cased identifiers the statement uses as references: bare or quoted,
  * each part of a qualified name on its own (`s.quantity` yields `s` and
  * `quantity`). Skipped: string literals, comments, aliases and cast targets
- * (`AS name`, `::TYPE`), function names (`sum(`), typed literals (`DATE '…'`).
+ * (`AS name`, `::TYPE`), function names (`sum(`), typed literals (`DATE '…'`),
+ * and bare SQL keywords (KEYWORD_WORDS).
  */
 function referencedIdentifiers(sql: string): Set<string> {
   const tokens = sqlTokens(sql);
@@ -316,6 +370,7 @@ function referencedIdentifiers(sql: string): Set<string> {
       return;
     }
     if (tok.kind === "word" && next && (next.text === "(" || next.kind === "string")) return;
+    if (tok.kind === "word" && KEYWORD_WORDS.has(tok.text.toLowerCase())) return;
     names.add(tok.text.toLowerCase());
   });
   return names;

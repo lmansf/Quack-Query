@@ -10,6 +10,7 @@
 import {
   ANSWER_MAX_ROWS,
   LOOP_CELL_CHARS,
+  LOOP_ERROR_CHARS,
   LOOP_MAX_QUERIES,
   LOOP_SAMPLE_ROWS,
   type DatasetProfile,
@@ -82,6 +83,94 @@ export function describeLoopModelView(dataset: DatasetProfile): string {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Shape-only mode: keep values out of error text and column names
+// ---------------------------------------------------------------------------
+
+/** DuckDB error classes raised before any data is read: their messages name only query and schema objects. */
+const COMPILE_ERROR_RE = /^(?:Parser|Binder|Catalog) Error:/;
+
+const TYPE_NAME = String.raw`[A-Z][A-Z0-9_]*(?:\([^'"…\n]*\))?`;
+const SOURCE_COLUMN = String.raw`(?: when casting from source column [^\s'"…]+)?`;
+
+/**
+ * Runtime error messages a shape-only loop may pass on once quoted text and numbers
+ * are masked: in each, every place a data value can appear is a masked slot.
+ */
+const MASKED_ERROR_TEMPLATES: RegExp[] = [
+  new RegExp(String.raw`^Conversion Error: Could not convert string '…' to ${TYPE_NAME}${SOURCE_COLUMN}$`),
+  new RegExp(String.raw`^Conversion Error: invalid [a-z ]+ format: "…", expected format is \([^'"…]*\)${SOURCE_COLUMN}$`),
+  new RegExp(
+    String.raw`^Conversion Error: Type ${TYPE_NAME} with value (?:…|'…') can’t be cast ` +
+      String.raw`(?:because the value is out of range for|to) the destination type ${TYPE_NAME}${SOURCE_COLUMN}$`,
+  ),
+  /^Conversion Error: Date out of range: …(?:-…)*$/,
+  new RegExp(String.raw`^Out of Range Error: Overflow in (?:addition|subtraction|multiplication|division) of ${TYPE_NAME} \(… [-+*/] …\)!?$`),
+  /^Invalid Input Error: Could not parse string "…" according to format specifier "…"$/,
+  /^Query stopped after … seconds\. The database was restarted and your files were reloaded\.$/,
+];
+
+/**
+ * Masks quoted text and numbers; contractions ("can't") are not quotes. Numbers are
+ * matched after a non-word character rather than with a lookbehind, which older
+ * Safari versions cannot parse.
+ */
+function maskValues(line: string): string {
+  return line
+    .replace(/\b([A-Za-z]+)'t\b/g, "$1’t")
+    .replace(/'(?:[^']|'')*'?/g, "'…'")
+    .replace(/"(?:[^"]|"")*"?/g, '"…"')
+    .replace(/(^|[^A-Za-z0-9_])\d[\d.,]*(?![A-Za-z0-9_])/g, "$1…");
+}
+
+/**
+ * What a shape-only loop may tell the model about a failed query. Parser, Binder,
+ * and Catalog errors pass through: DuckDB raises them before reading any data, and
+ * the names they quote are what the model needs to fix its query. Other errors
+ * (conversion, invalid input, out of range...) can quote cell values, so they are
+ * cut to their first line with quoted text and numbers masked, and kept only when
+ * they match a known message with nothing else left; otherwise only the error class
+ * is reported. Idempotent.
+ */
+export function shapeOnlyError(message: string): string {
+  const text = message.trim();
+  if (COMPILE_ERROR_RE.test(text)) return text;
+  const first = maskValues(text.split("\n", 1)[0] ?? "");
+  if (MASKED_ERROR_TEMPLATES.some((re) => re.test(first))) return first;
+  const kind = /^([A-Z][A-Za-z ]{0,40}? Error):/.exec(first)?.[1] ?? "Error";
+  return `${kind}: details hidden because result values are not shared with the model`;
+}
+
+/** Lower-cased words (letters, digits, underscores) of a name or statement. */
+function words(text: string): string[] {
+  return text.toLowerCase().match(/[\p{L}\p{N}_]+/gu) ?? [];
+}
+
+/**
+ * Result column names a shape-only loop may show the model. A name made only of
+ * words that appear in the query itself or in the schema's table and column names is
+ * kept (aliases, `sum("quantity")`, `count_star()`); any other name can only have come
+ * from the data, as PIVOT turns values into column names, and becomes
+ * "[hidden name n]". Idempotent.
+ */
+export function hideDataNames(columns: string[], sql: string, dataset: DatasetProfile): string[] {
+  const known = new Set(["count_star", ...words(sql)]);
+  for (const table of dataset.tables) {
+    for (const w of words(table.table)) known.add(w);
+    for (const col of table.columns) for (const w of words(col.name)) known.add(w);
+  }
+  return columns.map((name, i) => (words(name).every((w) => known.has(w)) ? name : `[hidden name ${i + 1}]`));
+}
+
+/** An error message as the loop passes it on: values masked in shape-only mode, at most LOOP_ERROR_CHARS. */
+export function loopErrorText(message: string, shapeOnly: boolean): string {
+  return (shapeOnly ? shapeOnlyError(message) : message.trim()).slice(0, LOOP_ERROR_CHARS);
+}
+
+// ---------------------------------------------------------------------------
+// Per-turn message
+// ---------------------------------------------------------------------------
+
 /** One cell or header of a result table: line breaks flattened, capped at LOOP_CELL_CHARS. */
 function cell(value: string): string {
   return value.replace(/\r?\n|\r/g, " ").slice(0, LOOP_CELL_CHARS);
@@ -107,6 +196,8 @@ function describeAttempt(attempt: LoopAttempt, shapeOnly: boolean): string[] {
     if (rowCount > rows.length) lines.push(`First ${rows.length} rows:`);
     lines.push(columns.map(cell).join(" | "));
     for (const row of rows) lines.push(row.map(cell).join(" | "));
+  } else if (!shapeOnly && rowCount > 0 && columns.length > 0) {
+    lines.push("(Sample rows of this query are left out to keep the request small.)");
   }
   return lines;
 }
@@ -129,7 +220,10 @@ export function buildLoopUserMessage(req: StepRequest): string {
 
   lines.push("", "Queries run so far:");
   if (req.shapeOnly) {
-    lines.push("Result values are hidden at the user's request: only the shape of each result (row count, columns, and types) and any error are shown.");
+    lines.push(
+      "Result values are hidden at the user's request: only the shape of each result (row count, columns, and types) " +
+        "and any error are shown, with values masked as … and column names that could come from the data hidden.",
+    );
   }
   if (req.attempts.length === 0) lines.push("(none yet)");
   req.attempts.forEach((attempt, i) => {
