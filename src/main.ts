@@ -17,26 +17,33 @@ import {
 } from "./duck";
 import { chartSpec, renderChart } from "./chart";
 import { downloadBytes, exportFileName } from "./download";
+import { MappingError, mappingHit, runLoop, type LoopOutcome } from "./loop";
 import { newResponseId, sendEvent } from "./telemetry";
+import { createTrace, type Trace } from "./trace";
 import { VARIANT } from "./variant";
-import { describeModelView } from "../shared/prompt";
+import { describeLoopModelView } from "../shared/loop";
 import { externalReference } from "../shared/sql";
 import {
   ANSWER_MAX_CELL_CHARS,
   ANSWER_MAX_COLUMNS,
   ANSWER_MAX_ROWS,
+  LOOP_MAX_QUERIES,
+  LOOP_SAMPLE_ROWS,
   MAX_COMMENT_CHARS,
+  MAX_PREDICTED_COLUMNS,
   type AnswerRequest,
   type AnswerResponse,
   type ColumnProfile,
   type DatasetProfile,
+  type MappingRequest,
+  type MappingResponse,
   type QueryError,
-  type QueryRequest,
-  type QueryResponse,
   type RelationshipHint,
   type ResponseEvent,
   type ResponseOutcome,
   type ResponseSource,
+  type StepRequest,
+  type StepResponse,
   type TableProfile,
 } from "../shared/types";
 
@@ -199,6 +206,8 @@ interface Shell {
   askButton: HTMLButtonElement;
   status: HTMLDivElement;
   error: HTMLDivElement;
+  /** "How this answer was found": the query loop's live step list, above the output. */
+  trace: Trace;
   output: HTMLElement;
   sql: HTMLDivElement;
   results: HTMLDivElement;
@@ -206,12 +215,13 @@ interface Shell {
   /** "Was this response helpful?" bar; its own section so it shows even when the output is hidden. */
   feedback: HTMLElement;
   history: HTMLElement;
+  /** Lets the model see result rows: during the query loop and for the written answer. */
   answerToggle: HTMLInputElement;
   /**
    * Orders the page for one of its two states. Nodes are moved, never recreated, so
-   * listeners survive. With tables: ask (primary) → error → output → feedback → data
-   * (secondary) → history. Without: the big dropzone → error → output (for history
-   * replays) → feedback → history.
+   * listeners survive. With tables: ask (primary) → error → trace → output → feedback
+   * → data (secondary) → history. Without: the big dropzone → error → trace → output
+   * (for history replays) → feedback → history.
    */
   arrange: (hasTables: boolean) => void;
 }
@@ -308,7 +318,8 @@ function renderShell(root: HTMLElement): Shell {
     "label",
     { className: "option" },
     answerToggle,
-    " Write a plain-language answer (sends the first 50 result rows to the model)",
+    ` Let the model see result rows (the first ${LOOP_SAMPLE_ROWS} of each query it runs) and write a ` +
+      `plain-language answer (from the first ${ANSWER_MAX_ROWS})`,
   );
 
   const ask = el(
@@ -316,7 +327,9 @@ function renderShell(root: HTMLElement): Shell {
     { className: "ask" },
     el("p", {
       className: "hint",
-      text: "Ask in plain language. The model writes one SQL query; you can edit it before re-running.",
+      text:
+        `Ask in plain language. The model can run up to ${LOOP_MAX_QUERIES} queries to work out the answer; ` +
+        "you can edit the final SQL before re-running.",
     }),
     form,
     answerOption,
@@ -325,6 +338,8 @@ function renderShell(root: HTMLElement): Shell {
 
   const error = el("div", { className: "error" });
   error.hidden = true;
+
+  const trace = createTrace();
 
   const sql = el("div", { className: "output-sql" });
   const results = el("div", { className: "output-results" });
@@ -346,11 +361,13 @@ function renderShell(root: HTMLElement): Shell {
     {},
     el("p", {
       text:
-        "Files are processed locally with DuckDB Wasm. The model only receives the schema profiles " +
-        "(column names, types, counts, ranges, low-cardinality values, and relationship hints) and, " +
-        "for the written answer, the first 50 rows of each query result. Ratings, optional comments, " +
-        "and outcome metrics (timing, row counts, error types; never your questions, SQL, or data) " +
-        "are stored to compare versions of the app.",
+        "Files are processed locally with DuckDB Wasm. Your question and the schema profiles (column names, " +
+        "types, counts, ranges, low-cardinality values, and relationship hints) go to Jev, TypeSafe's " +
+        "classifier, which predicts the columns the query needs, and to the model. Queries run in your " +
+        "browser; the model sees each result's shape and, while result rows are shared, the first " +
+        `${LOOP_SAMPLE_ROWS} rows of each query and the first ${ANSWER_MAX_ROWS} for the written answer. ` +
+        "Ratings, optional comments, and outcome metrics (timing, row counts, error types, and the names " +
+        "of the predicted columns; never your questions, SQL, or data) are stored to compare versions of the app.",
     }),
   );
 
@@ -361,10 +378,10 @@ function renderShell(root: HTMLElement): Shell {
     if (hasTables) {
       ask.append(status);
       dataHeader.after(pastePanel);
-      root.append(header, upload, ask, error, output, feedback, data, history, footer);
+      root.append(header, upload, ask, error, trace.element, output, feedback, data, history, footer);
     } else {
       upload.append(pastePanel, status);
-      root.append(header, upload, ask, error, output, feedback, history, data, footer);
+      root.append(header, upload, ask, error, trace.element, output, feedback, history, data, footer);
     }
   };
 
@@ -388,6 +405,7 @@ function renderShell(root: HTMLElement): Shell {
     askButton,
     status,
     error,
+    trace,
     output,
     sql,
     results,
@@ -438,7 +456,7 @@ function renderTables(
 
 /** Fills the collapsible panel showing the exact system prompt the model receives for this dataset. */
 function renderModelView(container: HTMLDetailsElement, dataset: DatasetProfile): void {
-  const text = describeModelView(dataset);
+  const text = describeLoopModelView(dataset);
   const pre = el("pre", { text });
   const copy = el("button", { className: "secondary", text: "Copy prompt" });
   copy.type = "button";
@@ -462,7 +480,9 @@ function renderModelView(container: HTMLDetailsElement, dataset: DatasetProfile)
       { className: "details-body" },
       el("p", {
         className: "muted",
-        text: "This is the exact system prompt sent with every question. It never contains row data; only the optional written answer sends result rows.",
+        text:
+          "This is the exact system prompt sent with every step of the query loop. It never contains row data; " +
+          "result rows reach the model only while result rows are shared.",
       }),
       pre,
       el("div", { className: "model-view-actions" }, copy),
@@ -832,6 +852,15 @@ interface ResponseEnd {
   answerMs?: number;
 }
 
+/** The query loop's measurements, reported with a question's response (filled in as the loop runs). */
+type LoopMetrics = Pick<
+  ResponseEvent,
+  "attempts" | "finalWasNew" | "predictedK" | "predictedColumns" | "mappingHit" | "mappingMs"
+>;
+
+/** Longest predicted-column name /api/event accepts ("table.column"). */
+const MAX_EVENT_COLUMN_CHARS = 200;
+
 /**
  * Times one response (an Ask, an edited Run, or a history Load) from the user's action
  * and reports it exactly once. Outcome metrics only: never the question, SQL, or data.
@@ -841,6 +870,8 @@ interface ResponseTracker {
   readonly source: ResponseSource;
   /** Model that wrote the SQL, when known. */
   model: string | undefined;
+  /** Set for a question answered by the query loop. */
+  loop: LoopMetrics | undefined;
   /** Results or an error are on screen: stops the latency clock. Only the first call counts. */
   shown(): void;
   /** Takes time spent waiting on the user (the large-result confirm) out of the latency. */
@@ -862,6 +893,7 @@ function trackResponse(
     id: newResponseId(),
     source,
     model: context.model,
+    loop: undefined,
     shown() {
       latencyMs ??= Math.max(0, Math.round(performance.now() - startedAt - waitedMs));
     },
@@ -886,6 +918,7 @@ function trackResponse(
         answerStep: ok && end.answerStep === true,
         answerMs: end.answerMs === undefined ? undefined : Math.max(0, Math.round(end.answerMs)),
         tables: context.tables,
+        ...tracker.loop,
       });
     },
   };
@@ -995,17 +1028,16 @@ async function postJson(path: string, body: unknown): Promise<Response> {
   return res;
 }
 
-/** Asks /api/query for SQL; `model` names the model that wrote it, when the server says. */
-async function askClaude(dataset: DatasetProfile, question: string): Promise<QueryResponse> {
-  const body: QueryRequest = { dataset, question };
-  const res = await postJson("/api/query", body);
+/** Asks /api/mapping for Jev's prediction of the columns the question needs (runLoop checks the shape). */
+async function fetchMapping(body: MappingRequest): Promise<MappingResponse> {
+  const res = await postJson("/api/mapping", body);
+  return (await res.json()) as MappingResponse;
+}
 
-  const data = (await res.json()) as Partial<QueryResponse>;
-  if (typeof data.sql !== "string" || !data.sql.trim()) {
-    throw new Error("The server returned no SQL.");
-  }
-  const model = typeof data.model === "string" && data.model ? data.model : undefined;
-  return { sql: data.sql.trim(), model };
+/** Asks /api/step for the model's next move in the query loop (runLoop checks the shape). */
+async function fetchStep(body: StepRequest): Promise<StepResponse> {
+  const res = await postJson("/api/step", body);
+  return (await res.json()) as StepResponse;
 }
 
 async function askForAnswer(body: AnswerRequest): Promise<string> {
@@ -1093,6 +1125,7 @@ function main(): void {
 
   const resetOutput = (): void => {
     hideError(ui.error);
+    ui.trace.reset();
     clear(ui.sql);
     editor = null;
     clear(ui.results);
@@ -1259,9 +1292,65 @@ function main(): void {
   };
 
   /**
-   * Runs SQL that is already in the editor: renders results, applies the model-error
-   * convention, writes the answer, records the outcome in history, and finishes the
-   * response. Shared by the Ask flow, the editor's Run button, and history replay.
+   * Asks before showing a result of more than LARGE_RESULT_ROWS rows. On "no", records the
+   * cancellation (history and response) and returns false. The time the dialog is open is
+   * left out of the response's latency.
+   */
+  const confirmLargeResult = (question: string, sql: string, count: number, response: ResponseTracker): boolean => {
+    if (count <= LARGE_RESULT_ROWS) return true;
+    const askedAt = performance.now();
+    const proceed = window.confirm(
+      `This query returns ${count.toLocaleString()} rows. Only the first ${MAX_ROWS.toLocaleString()} ` +
+        `will be displayed and the written answer sees the first ${ANSWER_MAX_ROWS}. ` +
+        `You can export the full result afterwards. Continue?`,
+    );
+    response.excludeWait(performance.now() - askedAt);
+    if (proceed) return true;
+    setStatus(`Cancelled. The query would return ${count.toLocaleString()} rows.`);
+    recordHistory({ question, sql, source: response.source, rowCount: count });
+    response.finish("cancelled");
+    return false;
+  };
+
+  /**
+   * Shows a query's result: applies the model-error convention, renders the rows, records
+   * the outcome in history, writes the answer when `answerStep` is set, and finishes the
+   * response. Throws only if rendering does; the caller manages `busy`.
+   */
+  const presentResult = async (
+    question: string,
+    sql: string,
+    result: QueryResult,
+    response: ResponseTracker,
+    answerStep: boolean,
+  ): Promise<void> => {
+    const source: HistorySource = response.source;
+    const modelError = modelErrorFrom(result);
+    if (modelError !== null) {
+      setStatus("");
+      showError(ui.error, modelError);
+      recordHistory({ question, sql, source, error: modelError });
+      response.finish("model_error");
+      return;
+    }
+    lastRun = { sql, rowCount: result.rowCount };
+    renderResults(ui.results, result, { onExport: (format) => void handleExport(format) });
+    response.shown();
+    recordHistory({ question, sql, source, rowCount: result.rowCount });
+    let answerMs: number | undefined;
+    if (answerStep) {
+      const answerStart = performance.now();
+      await writeAnswer(question, sql, result);
+      answerMs = performance.now() - answerStart;
+    }
+    setStatus("Done.");
+    response.finish("ok", { rowCount: result.rowCount, answerStep, answerMs });
+  };
+
+  /**
+   * Runs SQL that is already in the editor: counts the rows (confirming enormous results),
+   * runs the query, and presents the result. Used by the editor's Run button and history
+   * replay; a question's final query comes out of the query loop instead.
    */
   const executeSql = async (question: string, sql: string, response: ResponseTracker): Promise<void> => {
     if (busy) return;
@@ -1296,45 +1385,11 @@ function main(): void {
       } catch {
         count = undefined; // not a subquery-able statement; the preview falls back to a plain run
       }
-      if (count !== undefined && count > LARGE_RESULT_ROWS) {
-        const askedAt = performance.now();
-        const proceed = window.confirm(
-          `This query returns ${count.toLocaleString()} rows. Only the first ${MAX_ROWS.toLocaleString()} ` +
-            `will be displayed and the written answer sees the first ${ANSWER_MAX_ROWS}. ` +
-            `You can export the full result afterwards. Continue?`,
-        );
-        response.excludeWait(performance.now() - askedAt);
-        if (!proceed) {
-          setStatus(`Cancelled. The query would return ${count.toLocaleString()} rows.`);
-          recordHistory({ question, sql, source, rowCount: count });
-          response.finish("cancelled");
-          return;
-        }
-      }
+      if (count !== undefined && !confirmLargeResult(question, sql, count, response)) return;
 
       setStatus("Running query…");
       const result = await runQueryPreview(sql, MAX_ROWS, count);
-      const modelError = modelErrorFrom(result);
-      if (modelError !== null) {
-        setStatus("");
-        showError(ui.error, modelError);
-        recordHistory({ question, sql, source, error: modelError });
-        response.finish("model_error");
-      } else {
-        lastRun = { sql, rowCount: result.rowCount };
-        renderResults(ui.results, result, { onExport: (format) => void handleExport(format) });
-        response.shown();
-        recordHistory({ question, sql, source, rowCount: result.rowCount });
-        const answerStep = ui.answerToggle.checked;
-        let answerMs: number | undefined;
-        if (answerStep) {
-          const answerStart = performance.now();
-          await writeAnswer(question, sql, result);
-          answerMs = performance.now() - answerStart;
-        }
-        setStatus("Done.");
-        response.finish("ok", { rowCount: result.rowCount, answerStep, answerMs });
-      }
+      await presentResult(question, sql, result, response, ui.answerToggle.checked);
     } catch (err) {
       const message = `Query failed: ${errorMessage(err)}`;
       setStatus("");
@@ -1380,6 +1435,11 @@ function main(): void {
     }
   };
 
+  /**
+   * A question: Jev predicts the columns it needs, then the model runs up to
+   * LOOP_MAX_QUERIES queries here in the browser, seeing each result, before it names
+   * the final query. The trace shows every step; the final query lands in the editor.
+   */
   const handleQuestion = async (question: string): Promise<void> => {
     if (dataset.tables.length === 0 || busy) return;
     const response = startResponse("model");
@@ -1387,37 +1447,86 @@ function main(): void {
     updateFormState();
     resetOutput();
     lastQuestion = question;
+    // Read once: toggling the option mid-loop must not change what this question shares.
+    const shareRows = ui.answerToggle.checked;
+    const metrics: LoopMetrics = {};
+    response.loop = metrics;
 
-    let sql: string;
     try {
-      setStatus("Asking Claude…");
-      const reply = await askClaude(dataset, question);
-      sql = reply.sql;
-      response.model = reply.model;
-      lastModel = reply.model;
+      let outcome: LoopOutcome;
+      try {
+        outcome = await runLoop(
+          { dataset, question, shapeOnly: !shareRows },
+          {
+            fetchMapping,
+            fetchStep,
+            runSql: (sql) => runQueryPreview(sql, MAX_ROWS),
+            onProgress: (p) => {
+              ui.trace.update(p);
+              if (p.kind === "mapping-start") {
+                setStatus("Predicting the columns this question needs…");
+              } else if (p.kind === "mapping-done") {
+                metrics.predictedK = p.mapping.k;
+                metrics.predictedColumns = p.mapping.columns
+                  .slice(0, MAX_PREDICTED_COLUMNS)
+                  .map((c) => `${c.table}.${c.column}`.slice(0, MAX_EVENT_COLUMN_CHARS));
+                metrics.mappingMs = p.ms;
+                metrics.attempts = 0;
+              } else if (p.kind === "step-start") {
+                setStatus(`Asking the model… (queries remaining: ${p.remaining} of ${LOOP_MAX_QUERIES})`);
+              } else if (p.kind === "attempt-done") {
+                metrics.attempts = p.index;
+              } else if (p.kind === "final" && p.reusedAttempt === null && p.refused === undefined) {
+                setStatus("Running the final query…");
+              }
+            },
+          },
+        );
+      } catch (err) {
+        // Jev or a loop step failed: stop here with the error (no fallback to a single query).
+        const message = errorMessage(err);
+        ui.trace.fail(message);
+        setStatus("");
+        showError(ui.error, message);
+        response.finish(err instanceof MappingError ? "mapping_error" : "api_error");
+        return;
+      }
+
+      response.model = outcome.model;
+      lastModel = outcome.model;
+      metrics.attempts = outcome.attempts.length;
+      metrics.finalWasNew = outcome.finalWasNew;
+      metrics.mappingHit = mappingHit(outcome.mapping.columns, outcome.finalSql);
+
+      // Always show the final SQL, even when it can't be run, so the user can correct it in the editor.
+      showSql(outcome.finalSql);
+
+      if (outcome.finalRefused !== undefined) {
+        setStatus("");
+        showError(ui.error, `The final query was not run: ${outcome.finalRefused}.`);
+        response.finish("refused");
+        return;
+      }
+      if (outcome.finalResult === null) {
+        const message = `Query failed: ${outcome.finalError ?? "the query did not run."}`;
+        setStatus("");
+        showError(ui.error, message);
+        recordHistory({ question, sql: outcome.finalSql, source: "model", error: message });
+        response.finish("query_error");
+        return;
+      }
+      // The loop fetched only a preview, but an enormous result still gets the same warning as a re-run.
+      if (!confirmLargeResult(question, outcome.finalSql, outcome.finalResult.rowCount, response)) return;
+      await presentResult(question, outcome.finalSql, outcome.finalResult, response, shareRows);
     } catch (err) {
+      const message = `Query failed: ${errorMessage(err)}`;
       setStatus("");
-      showError(ui.error, errorMessage(err));
+      showError(ui.error, message);
+      response.finish("query_error");
+    } finally {
       busy = false;
       updateFormState();
-      response.finish("api_error");
-      return;
     }
-
-    // Always show the SQL, even when it can't be run, so the user can correct it in the editor.
-    showSql(sql);
-
-    if (!isReadOnlySql(sql)) {
-      setStatus("");
-      showError(ui.error, "The generated SQL is not a read-only SELECT statement, so it was not run.");
-      busy = false;
-      updateFormState();
-      response.finish("refused");
-      return;
-    }
-
-    busy = false;
-    await executeSql(question, sql, response);
   };
 
   /** Run button / Ctrl+Enter: executes whatever is in the editor, keeping the text as typed. */
@@ -1443,6 +1552,7 @@ function main(): void {
     ui.questionInput.value = entry.question;
     lastQuestion = entry.question;
     hideError(ui.error);
+    ui.trace.reset(); // the trace on screen belongs to another question
     clear(ui.results);
     hideAnswer(ui.answer);
     hideFeedback(ui.feedback); // also when nothing runs: the bar belonged to the output just cleared

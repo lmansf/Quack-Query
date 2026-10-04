@@ -5,4 +5,4 @@ import type { Variant } from "../shared/types";
  * the claude/variant-b-jev-loop branch sets this to "B". Every response and
  * feedback event is tagged with it.
  */
-export const VARIANT: Variant = "A";
+export const VARIANT: Variant = "B";

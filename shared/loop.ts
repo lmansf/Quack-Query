@@ -8,6 +8,7 @@
  * native ESM resolver on Vercel (Vite and tsc map `.js` back to `.ts`).
  */
 import {
+  ANSWER_MAX_ROWS,
   LOOP_CELL_CHARS,
   LOOP_MAX_QUERIES,
   LOOP_SAMPLE_ROWS,
@@ -66,6 +67,19 @@ export function buildLoopSystemPrompt(dataset: DatasetProfile): string {
     lines.push("", "No relationship hints were detected; join only on columns with matching names and compatible types.");
   }
   return lines.join("\n");
+}
+
+/** The "What the model sees" panel: the loop's system prompt plus what else each request carries. */
+export function describeLoopModelView(dataset: DatasetProfile): string {
+  return (
+    buildLoopSystemPrompt(dataset) +
+    "\n\n---\n" +
+    "Per question, Jev (TypeSafe's classifier) first receives your question and this schema profile to predict the " +
+    "columns the query needs. Each step of the loop then sends the model your question, Jev's predicted columns, every " +
+    "query run so far with its result (row count, columns, and types, plus the first " +
+    `${LOOP_SAMPLE_ROWS} rows when result rows are shared), and the queries remaining. ` +
+    `For the written answer, a final request sends the question, the SQL that ran, and up to ${ANSWER_MAX_ROWS} result rows.`
+  );
 }
 
 /** One cell or header of a result table: line breaks flattened, capped at LOOP_CELL_CHARS. */
