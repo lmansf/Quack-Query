@@ -192,7 +192,7 @@ export async function POST(request: Request): Promise<Response> {
     if (!isReadOnlySql(sql)) return json(422, { error: "Model did not return a read-only query", sql });
     const external = externalReference(sql);
     if (external !== null) return json(422, { error: `Model returned a query that references ${external}; refused`, sql });
-    return json(200, { sql });
+    return json(200, { sql, model: result.model });
   } catch (error) {
     if (error instanceof ProviderError) {
       console.error(`[query] ${selected.name} provider error ${error.status}: ${error.message}`);

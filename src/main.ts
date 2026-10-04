@@ -17,12 +17,15 @@ import {
 } from "./duck";
 import { chartSpec, renderChart } from "./chart";
 import { downloadBytes, exportFileName } from "./download";
+import { newResponseId, sendEvent } from "./telemetry";
+import { VARIANT } from "./variant";
 import { describeModelView } from "../shared/prompt";
 import { externalReference } from "../shared/sql";
 import {
   ANSWER_MAX_CELL_CHARS,
   ANSWER_MAX_COLUMNS,
   ANSWER_MAX_ROWS,
+  MAX_COMMENT_CHARS,
   type AnswerRequest,
   type AnswerResponse,
   type ColumnProfile,
@@ -31,6 +34,9 @@ import {
   type QueryRequest,
   type QueryResponse,
   type RelationshipHint,
+  type ResponseEvent,
+  type ResponseOutcome,
+  type ResponseSource,
   type TableProfile,
 } from "../shared/types";
 
@@ -197,12 +203,15 @@ interface Shell {
   sql: HTMLDivElement;
   results: HTMLDivElement;
   answer: HTMLDivElement;
+  /** "Was this response helpful?" bar; its own section so it shows even when the output is hidden. */
+  feedback: HTMLElement;
   history: HTMLElement;
   answerToggle: HTMLInputElement;
   /**
    * Orders the page for one of its two states. Nodes are moved, never recreated, so
-   * listeners survive. With tables: ask (primary) → error → output → data (secondary)
-   * → history. Without: the big dropzone → error → output (for history replays) → history.
+   * listeners survive. With tables: ask (primary) → error → output → feedback → data
+   * (secondary) → history. Without: the big dropzone → error → output (for history
+   * replays) → feedback → history.
    */
   arrange: (hasTables: boolean) => void;
 }
@@ -324,6 +333,11 @@ function renderShell(root: HTMLElement): Shell {
   const output = el("section", { className: "output" }, sql, results, answer);
   output.hidden = true;
 
+  const feedback = el("section", { className: "feedback" });
+  feedback.setAttribute("aria-label", "Feedback");
+  feedback.setAttribute("aria-live", "polite");
+  feedback.hidden = true;
+
   const history = el("section", { className: "history" });
   history.hidden = true;
 
@@ -334,7 +348,9 @@ function renderShell(root: HTMLElement): Shell {
       text:
         "Files are processed locally with DuckDB Wasm. The model only receives the schema profiles " +
         "(column names, types, counts, ranges, low-cardinality values, and relationship hints) and, " +
-        "for the written answer, the first 50 rows of each query result.",
+        "for the written answer, the first 50 rows of each query result. Ratings, optional comments, " +
+        "and outcome metrics (timing, row counts, error types; never your questions, SQL, or data) " +
+        "are stored to compare versions of the app.",
     }),
   );
 
@@ -345,10 +361,10 @@ function renderShell(root: HTMLElement): Shell {
     if (hasTables) {
       ask.append(status);
       dataHeader.after(pastePanel);
-      root.append(header, upload, ask, error, output, data, history, footer);
+      root.append(header, upload, ask, error, output, feedback, data, history, footer);
     } else {
       upload.append(pastePanel, status);
-      root.append(header, upload, ask, error, output, history, data, footer);
+      root.append(header, upload, ask, error, output, feedback, history, data, footer);
     }
   };
 
@@ -376,6 +392,7 @@ function renderShell(root: HTMLElement): Shell {
     sql,
     results,
     answer,
+    feedback,
     history,
     answerToggle,
     arrange,
@@ -802,6 +819,154 @@ function modelErrorFrom(result: QueryResult): string | null {
 }
 
 // ---------------------------------------------------------------------------
+// A/B test: response metrics and feedback
+// ---------------------------------------------------------------------------
+
+/** What is only known once a response ends. */
+interface ResponseEnd {
+  /** Rows the query produced (reported for outcome "ok" only). */
+  rowCount?: number;
+  /** The written answer was requested (reported for outcome "ok" only). */
+  answerStep?: boolean;
+  /** How long the written-answer step took, when it ran. */
+  answerMs?: number;
+}
+
+/**
+ * Times one response (an Ask, an edited Run, or a history Load) from the user's action
+ * and reports it exactly once. Outcome metrics only: never the question, SQL, or data.
+ */
+interface ResponseTracker {
+  readonly id: string;
+  readonly source: ResponseSource;
+  /** Model that wrote the SQL, when known. */
+  model: string | undefined;
+  /** Results or an error are on screen: stops the latency clock. Only the first call counts. */
+  shown(): void;
+  /** Takes time spent waiting on the user (the large-result confirm) out of the latency. */
+  excludeWait(ms: number): void;
+  /** Builds the ResponseEvent (stopping the clock if still running) and reports it; later calls are ignored. */
+  finish(outcome: ResponseOutcome, end?: ResponseEnd): void;
+}
+
+function trackResponse(
+  source: ResponseSource,
+  context: { tables: number; model?: string },
+  report: (event: ResponseEvent) => void,
+): ResponseTracker {
+  const startedAt = performance.now();
+  let latencyMs: number | undefined;
+  let waitedMs = 0;
+  let finished = false;
+  const tracker: ResponseTracker = {
+    id: newResponseId(),
+    source,
+    model: context.model,
+    shown() {
+      latencyMs ??= Math.max(0, Math.round(performance.now() - startedAt - waitedMs));
+    },
+    excludeWait(ms) {
+      waitedMs += ms;
+    },
+    finish(outcome, end = {}) {
+      if (finished) return;
+      finished = true;
+      tracker.shown();
+      const ok = outcome === "ok";
+      // Undefined fields are dropped by JSON.stringify.
+      report({
+        type: "response",
+        id: tracker.id,
+        variant: VARIANT,
+        source,
+        outcome,
+        latencyMs: latencyMs ?? 0,
+        rowCount: ok ? end.rowCount : undefined,
+        model: tracker.model,
+        answerStep: ok && end.answerStep === true,
+        answerMs: end.answerMs === undefined ? undefined : Math.max(0, Math.round(end.answerMs)),
+        tables: context.tables,
+      });
+    },
+  };
+  return tracker;
+}
+
+/**
+ * Fills the feedback bar for a completed response: "Was this response helpful?" with
+ * 👍 / 👎. One vote per response: voting replaces the buttons. 👎 is sent at once, then
+ * offers an optional comment.
+ */
+function renderFeedback(container: HTMLElement, response: { id: string; source: ResponseSource }): void {
+  const about = { responseId: response.id, variant: VARIANT, source: response.source };
+  const thank = (text: string): void => {
+    container.replaceChildren(el("p", { className: "feedback-thanks", text }));
+  };
+
+  const showCommentForm = (): void => {
+    const box = el("textarea", { className: "feedback-comment" });
+    box.maxLength = MAX_COMMENT_CHARS;
+    box.rows = 3;
+    box.placeholder = "What went wrong? (optional)";
+    box.setAttribute("aria-label", "What went wrong? (optional)");
+    const send = el("button", { className: "send", text: "Send" });
+    send.type = "submit";
+    send.disabled = true;
+    const skip = el("button", { className: "secondary", text: "Skip" });
+    skip.type = "button";
+    const form = el("form", { className: "feedback-form" }, box, el("div", { className: "feedback-actions" }, send, skip));
+
+    box.addEventListener("input", () => {
+      send.disabled = !box.value.trim();
+    });
+    box.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        form.requestSubmit();
+      }
+    });
+    form.addEventListener("submit", (e) => {
+      e.preventDefault();
+      const comment = box.value.trim().slice(0, MAX_COMMENT_CHARS);
+      if (!comment) return;
+      sendEvent({ type: "comment", ...about, comment });
+      thank("Thanks, comment sent.");
+    });
+    skip.addEventListener("click", () => thank("Thanks for the feedback."));
+
+    container.replaceChildren(form);
+    box.focus();
+  };
+
+  const voteButton = (emoji: string, label: string): HTMLButtonElement => {
+    const button = el("button", { className: "secondary vote", text: emoji, title: label });
+    button.type = "button";
+    button.setAttribute("aria-label", label);
+    return button;
+  };
+  const up = voteButton("👍", "Helpful");
+  const down = voteButton("👎", "Not helpful");
+  up.addEventListener("click", () => {
+    sendEvent({ type: "feedback", ...about, rating: "up" });
+    thank("Thanks for the feedback.");
+  });
+  down.addEventListener("click", () => {
+    sendEvent({ type: "feedback", ...about, rating: "down" });
+    showCommentForm();
+  });
+
+  container.replaceChildren(
+    el("div", { className: "feedback-prompt" }, el("span", { text: "Was this response helpful?" }), up, down),
+  );
+  container.hidden = false;
+}
+
+function hideFeedback(container: HTMLElement): void {
+  clear(container);
+  container.hidden = true;
+}
+
+// ---------------------------------------------------------------------------
 // API call
 // ---------------------------------------------------------------------------
 
@@ -830,7 +995,8 @@ async function postJson(path: string, body: unknown): Promise<Response> {
   return res;
 }
 
-async function askClaude(dataset: DatasetProfile, question: string): Promise<string> {
+/** Asks /api/query for SQL; `model` names the model that wrote it, when the server says. */
+async function askClaude(dataset: DatasetProfile, question: string): Promise<QueryResponse> {
   const body: QueryRequest = { dataset, question };
   const res = await postJson("/api/query", body);
 
@@ -838,7 +1004,8 @@ async function askClaude(dataset: DatasetProfile, question: string): Promise<str
   if (typeof data.sql !== "string" || !data.sql.trim()) {
     throw new Error("The server returned no SQL.");
   }
-  return data.sql.trim();
+  const model = typeof data.model === "string" && data.model ? data.model : undefined;
+  return { sql: data.sql.trim(), model };
 }
 
 async function askForAnswer(body: AnswerRequest): Promise<string> {
@@ -864,6 +1031,8 @@ function main(): void {
   let dbReady = false;
   let busy = false;
   let lastQuestion = "";
+  /** Model that wrote the most recent SQL (when the server said); edited re-runs and history replays report it too. */
+  let lastModel: string | undefined;
   /** SQL and row count of the result currently on screen, for exports. */
   let lastRun: { sql: string; rowCount: number } | null = null;
   let editor: SqlEditor | null = null;
@@ -928,7 +1097,26 @@ function main(): void {
     editor = null;
     clear(ui.results);
     hideAnswer(ui.answer);
+    hideFeedback(ui.feedback);
     ui.output.hidden = true;
+  };
+
+  /**
+   * Starts a response (Ask, Run, or history Load): hides the previous response's feedback
+   * bar and starts timing. Finishing the tracker sends the ResponseEvent and, unless the
+   * user cancelled, shows the feedback bar for this response.
+   */
+  const startResponse = (source: ResponseSource): ResponseTracker => {
+    hideFeedback(ui.feedback);
+    return trackResponse(
+      source,
+      // A question's model is known once /api/query answers; re-runs reuse the last one seen.
+      { tables: dataset.tables.length, model: source === "model" ? undefined : lastModel },
+      (event) => {
+        sendEvent(event);
+        if (event.outcome !== "cancelled") renderFeedback(ui.feedback, event);
+      },
+    );
   };
 
   const showOutput = (): void => {
@@ -1072,11 +1260,12 @@ function main(): void {
 
   /**
    * Runs SQL that is already in the editor: renders results, applies the model-error
-   * convention, writes the answer, and records the outcome in history. Shared by the
-   * Ask flow, the editor's Run button, and history replay.
+   * convention, writes the answer, records the outcome in history, and finishes the
+   * response. Shared by the Ask flow, the editor's Run button, and history replay.
    */
-  const executeSql = async (question: string, sql: string, source: HistorySource): Promise<void> => {
+  const executeSql = async (question: string, sql: string, response: ResponseTracker): Promise<void> => {
     if (busy) return;
+    const source: HistorySource = response.source;
     busy = true;
     updateFormState();
     hideError(ui.error);
@@ -1094,6 +1283,7 @@ function main(): void {
       recordHistory({ question, sql, source, error: message });
       busy = false;
       updateFormState();
+      response.finish("refused");
       return;
     }
 
@@ -1107,14 +1297,17 @@ function main(): void {
         count = undefined; // not a subquery-able statement; the preview falls back to a plain run
       }
       if (count !== undefined && count > LARGE_RESULT_ROWS) {
+        const askedAt = performance.now();
         const proceed = window.confirm(
           `This query returns ${count.toLocaleString()} rows. Only the first ${MAX_ROWS.toLocaleString()} ` +
             `will be displayed and the written answer sees the first ${ANSWER_MAX_ROWS}. ` +
             `You can export the full result afterwards. Continue?`,
         );
+        response.excludeWait(performance.now() - askedAt);
         if (!proceed) {
           setStatus(`Cancelled. The query would return ${count.toLocaleString()} rows.`);
           recordHistory({ question, sql, source, rowCount: count });
+          response.finish("cancelled");
           return;
         }
       }
@@ -1126,18 +1319,28 @@ function main(): void {
         setStatus("");
         showError(ui.error, modelError);
         recordHistory({ question, sql, source, error: modelError });
+        response.finish("model_error");
       } else {
         lastRun = { sql, rowCount: result.rowCount };
         renderResults(ui.results, result, { onExport: (format) => void handleExport(format) });
+        response.shown();
         recordHistory({ question, sql, source, rowCount: result.rowCount });
-        if (ui.answerToggle.checked) await writeAnswer(question, sql, result);
+        const answerStep = ui.answerToggle.checked;
+        let answerMs: number | undefined;
+        if (answerStep) {
+          const answerStart = performance.now();
+          await writeAnswer(question, sql, result);
+          answerMs = performance.now() - answerStart;
+        }
         setStatus("Done.");
+        response.finish("ok", { rowCount: result.rowCount, answerStep, answerMs });
       }
     } catch (err) {
       const message = `Query failed: ${errorMessage(err)}`;
       setStatus("");
       showError(ui.error, message);
       recordHistory({ question, sql, source, error: message });
+      response.finish("query_error");
     } finally {
       busy = false;
       updateFormState();
@@ -1179,6 +1382,7 @@ function main(): void {
 
   const handleQuestion = async (question: string): Promise<void> => {
     if (dataset.tables.length === 0 || busy) return;
+    const response = startResponse("model");
     busy = true;
     updateFormState();
     resetOutput();
@@ -1187,12 +1391,16 @@ function main(): void {
     let sql: string;
     try {
       setStatus("Asking Claude…");
-      sql = await askClaude(dataset, question);
+      const reply = await askClaude(dataset, question);
+      sql = reply.sql;
+      response.model = reply.model;
+      lastModel = reply.model;
     } catch (err) {
       setStatus("");
       showError(ui.error, errorMessage(err));
       busy = false;
       updateFormState();
+      response.finish("api_error");
       return;
     }
 
@@ -1204,11 +1412,12 @@ function main(): void {
       showError(ui.error, "The generated SQL is not a read-only SELECT statement, so it was not run.");
       busy = false;
       updateFormState();
+      response.finish("refused");
       return;
     }
 
     busy = false;
-    await executeSql(question, sql, "model");
+    await executeSql(question, sql, response);
   };
 
   /** Run button / Ctrl+Enter: executes whatever is in the editor, keeping the text as typed. */
@@ -1216,28 +1425,33 @@ function main(): void {
     if (busy || !dbReady) return;
     const sql = text.trim();
     if (!sql) return;
+    const response = startResponse("edited");
     if (!isReadOnlySql(sql)) {
       setStatus("");
       showError(ui.error, "Only read-only SELECT statements can be run.");
+      response.finish("refused");
       return;
     }
-    await executeSql(currentQuestion(), sql, "edited");
+    await executeSql(currentQuestion(), sql, response);
   };
 
   /** History "Load": restores question + SQL and replays the query without calling the model. */
   const handleHistoryLoad = async (entry: HistoryEntry): Promise<void> => {
     if (busy || !dbReady) return;
+    // Without tables nothing runs, so there is no response to time or rate.
+    const response = dataset.tables.length > 0 ? startResponse("history") : null;
     ui.questionInput.value = entry.question;
     lastQuestion = entry.question;
     hideError(ui.error);
     clear(ui.results);
     hideAnswer(ui.answer);
+    hideFeedback(ui.feedback); // also when nothing runs: the bar belonged to the output just cleared
     showSql(entry.sql);
-    if (dataset.tables.length === 0) {
+    if (!response) {
       setStatus("Load a file, then press Run.");
       return;
     }
-    await executeSql(entry.question, entry.sql, "history");
+    await executeSql(entry.question, entry.sql, response);
   };
 
   // --- wiring ---------------------------------------------------------------

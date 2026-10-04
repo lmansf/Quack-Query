@@ -47,6 +47,27 @@ A small Vite plugin in `vite.config.ts` serves `api/*.ts` at `/api/*` during `np
 
 Deploy to [Vercel](https://vercel.com). It auto-detects the Vite app and the `api/` directory as serverless functions. In the project settings, add `GROQ_API_KEY` (and `LLM_PROVIDER=groq`), or `ANTHROPIC_API_KEY` for Anthropic.
 
+## A/B test
+
+Two variants run side by side:
+
+- **A** (this branch, the production branch): one SQL query per question, then the optional written answer.
+- **B** (branch `claude/variant-b-jev-loop`): Jev first predicts how many columns the question needs and picks them one by one; the model then gets that mapping as a hint on top of the full schema and may run up to 5 queries, seeing each result (and how many queries remain) before choosing a final query. The written answer step is the same as A's.
+
+Visitors to the production URL are split 50/50 by `middleware.ts`, which pins each browser with a `qq_variant` cookie and serves variant B's deployment on the same URL (pages, assets, and `/api/*`). Both variants record outcome metrics and thumbs up/down to the same store, and `/results` compares them.
+
+### Setup checklist (Vercel dashboard)
+
+1. **Storage.** Add Upstash for Redis from the Vercel Marketplace and connect it to this project for both Production and Preview. It injects `KV_REST_API_URL` and `KV_REST_API_TOKEN` (or `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN`). Without it the app works but nothing is recorded.
+2. **Results password.** Set `RESULTS_PASSWORD` (Production and Preview), then open `/results`.
+3. **Variant B deployment.** Push the B branch, then copy its stable branch URL from the deployment page (it looks like `https://<project>-git-claude-variant-b-jev-loop-<team>.vercel.app`).
+4. **Routing.** Set `VARIANT_B_ORIGIN` to that URL for **Production only**, and optionally `VARIANT_B_PERCENT` (default 50). Redeploy production. Leaving `VARIANT_B_ORIGIN` unset turns the split off (everyone gets A).
+5. **Deployment Protection.** Preview URLs are protected by default. Either enable "Protection Bypass for Automation" (the middleware forwards `VERCEL_AUTOMATION_BYPASS_SECRET` automatically, so B stays private) or turn protection off for previews.
+6. **Keys for B.** Make sure `GROQ_API_KEY` / `LLM_PROVIDER` have the Preview scope, and add `TYPESAFE_API_KEY` (Jev, from console.typesafe.ai) for Preview.
+7. **Check it.** Visit the production URL with `?variant=a` and `?variant=b` to pin your own browser to each side, ask a question, vote, and confirm the counts move on `/results`. Use the results page's default "model responses" view for the comparison; edited re-runs and history replays are recorded but excluded unless you tick the box.
+
+Results show thumbs-up rate with a 95% interval, feedback rate, success rate, median latency, and for B the queries used per question and how often Jev's predicted columns made it into the final SQL. The B − A difference comes with a two-proportion test p-value; treat anything above 0.05 as "not decided yet".
+
 ## Supported inputs
 
 Drop or pick files, or paste cells straight from a spreadsheet. Everything table-shaped becomes a table:
@@ -60,7 +81,7 @@ Drop or pick files, or paste cells straight from a spreadsheet. Everything table
 
 The functions are public and unauthenticated (the app has no accounts), so the design limits what a stranger or a malicious file can do:
 
-- **Server request guard** (`api/_providers/guard.ts`): cross-site browser requests are rejected (Origin / Sec-Fetch-Site must be same-origin), bodies are capped at 512 KB, and a per-IP token bucket allows 20 requests per minute per warm function instance (`RATE_LIMIT_PER_MINUTE` to change). This is best effort: set a spend limit on your Groq or Anthropic account as the hard cap.
+- **Server request guard** (`api/_providers/guard.ts`): cross-site browser requests are rejected, bodies are capped at 512 KB, POSTs must be JSON, and a per-IP token bucket allows 60 requests per minute per warm function instance (`RATE_LIMIT_PER_MINUTE` to change; variant B makes up to about 8 calls per question). A request passes the same-origin check when the browser marks it `Sec-Fetch-Site: same-origin` (this is what lets the A/B middleware serve B's functions on the production domain), or, for clients that omit that header, when its `Origin` matches the request host, the project's Vercel hostnames (`VERCEL_PROJECT_PRODUCTION_URL`, `VERCEL_BRANCH_URL`, `VERCEL_URL`), or `ALLOWED_ORIGINS` (comma-separated). This is best effort: set a spend limit on your Groq, Anthropic, and TypeSafe accounts as the hard cap.
 - **Input caps**: at most 25 tables, 400 columns per table, 25 listed values per column, 300 characters per string, and a 200,000-character prompt. The answer endpoint accepts at most 50 rows of 30 columns with 200-character cells.
 - **DuckDB is locked down at startup** (`src/duck.ts`): file access is restricted to the virtual `uploads/` prefix where uploaded files and export buffers live, external access and extension loading are disabled, and the configuration is locked so no statement can undo it. A model-generated query that tries to read a URL or another file fails inside the engine before any network call. The Parquet and JSON extensions are loaded once before the lock (from `extensions.duckdb.org`); if that download fails, Parquet and JSON files report a clear error until the page is reloaded.
 - **SQL is also checked in code, twice** (server and browser): a single read-only statement (`EXPLAIN` is excluded because `EXPLAIN ANALYZE` executes), with comments stripped, and no URLs, file-reading functions (`read_*`, `*_scan`, `glob`), or extension, attach, copy, or settings keywords. Keywords inside string literals and quoted identifiers are ignored, so a column named `import` still works.
@@ -77,5 +98,6 @@ Residual risks to be aware of before sharing: the rate limit is per function ins
 Your files are parsed and queried entirely in the browser with DuckDB Wasm and are never uploaded. What does leave the browser, and goes to the LLM provider you configured:
 
 - **With every question:** the schema profile of each table: column names and types, row/distinct/null counts, min and max of numeric and date columns, relationship hints, and the full list of distinct values for columns with 20 or fewer distinct values. Columns that look personal (emails, phone numbers, people's names, addresses, identifiers, secrets) have their values withheld automatically and are marked "withheld" in the Tables panel; the "What the model sees" panel shows the exact text.
-- **For the written answer:** the question, the SQL, and the first 50 rows of the query result (30 columns, 200 characters per cell at most). This is row data. If your results are sensitive, skip the answer step by clearing the result or treat the provider as a processor of that data.
+- **For the written answer:** the question, the SQL, and the first 50 rows of the query result (30 columns, 200 characters per cell at most). This is row data. Untick "Write a plain-language answer" under the question box to skip it.
+- **To the app's own store (for the A/B comparison):** thumbs up/down, optional comments you type after a thumbs down, and outcome metrics per response: variant, timing, row count, error type, model name, and for variant B the number of queries and the predicted column names. Never your questions, SQL, or data values.
 - **Nothing else.** Query history stays in your browser's localStorage.

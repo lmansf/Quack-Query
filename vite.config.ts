@@ -1,4 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { fileURLToPath } from "node:url";
 import { defineConfig, loadEnv, type Plugin, type ViteDevServer } from "vite";
 
 type ApiHandler = (request: Request) => Response | Promise<Response>;
@@ -113,4 +114,13 @@ async function handleApi(
 export default defineConfig(({ mode }) => ({
   plugins: [localApi(mode)],
   optimizeDeps: { exclude: ["@duckdb/duckdb-wasm"] },
+  build: {
+    rollupOptions: {
+      // Two pages: the app, and the password-protected A/B results page (/results).
+      input: {
+        main: fileURLToPath(new URL("./index.html", import.meta.url)),
+        results: fileURLToPath(new URL("./results.html", import.meta.url)),
+      },
+    },
+  },
 }));

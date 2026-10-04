@@ -99,6 +99,8 @@ export interface QueryRequest {
 export interface QueryResponse {
   /** A single read-only DuckDB SQL statement, no trailing semicolon, no fences. */
   sql: string;
+  /** Model that served the request (recorded in outcome metrics). */
+  model?: string;
 }
 
 /** POST /api/query error response body (non-2xx status). */
@@ -127,4 +129,133 @@ export interface AnswerRequest {
 export interface AnswerResponse {
   /** Short plain-text answer to the question, grounded in the result. */
   answer: string;
+}
+
+// ---------------------------------------------------------------------------
+// A/B test: variants, outcome metrics, and feedback
+// ---------------------------------------------------------------------------
+
+/** "A" is the original app; "B" adds Jev column prediction and the query loop. */
+export type Variant = "A" | "B";
+
+/** How a response came about: the model answering a question, an edited re-run, or a history replay. */
+export type ResponseSource = "model" | "edited" | "history";
+
+/** Final state of one response. */
+export type ResponseOutcome =
+  | "ok" // results shown
+  | "query_error" // DuckDB rejected or failed the query
+  | "model_error" // the model said the question cannot be answered (single `error` column)
+  | "refused" // the SQL failed the read-only / external-access checks
+  | "api_error" // /api/query (or B's loop/mapping endpoints) returned an error
+  | "mapping_error" // B only: Jev column prediction failed, so B stopped
+  | "cancelled"; // the user declined the large-result warning
+
+/** Pattern every client-generated response id must match. */
+export const EVENT_ID_PATTERN = /^[A-Za-z0-9_-]{8,64}$/;
+/** Longest accepted feedback comment, in characters. */
+export const MAX_COMMENT_CHARS = 500;
+/** Most predicted columns recorded per response. */
+export const MAX_PREDICTED_COLUMNS = 16;
+
+/**
+ * Sent once per response (success or failure). Outcome metrics only: no
+ * question text, SQL, or data values. Column names in `predictedColumns` are
+ * schema information, the same kind the model already receives.
+ */
+export interface ResponseEvent {
+  type: "response";
+  /** Client-generated id; feedback events reference it. */
+  id: string;
+  variant: Variant;
+  source: ResponseSource;
+  outcome: ResponseOutcome;
+  /** Milliseconds from submitting the question (or pressing Run/Load) to results or an error on screen. */
+  latencyMs: number;
+  /** Rows the final query produced, when outcome is "ok". */
+  rowCount?: number;
+  /** Model that wrote the SQL, when known. */
+  model?: string;
+  /** Whether the written-answer step was requested for this response. */
+  answerStep: boolean;
+  /** Milliseconds the written-answer step took, when it ran. */
+  answerMs?: number;
+  /** Number of tables loaded when the response was produced. */
+  tables: number;
+  // --- Variant B only -------------------------------------------------------
+  /** Queries the loop ran (0-5), excluding the final query when it was new. */
+  attempts?: number;
+  /** True when the model's final SQL differed from every query it had run. */
+  finalWasNew?: boolean;
+  /** Number of columns Jev predicted the question needs. */
+  predictedK?: number;
+  /** "table.column" for each predicted column, in prediction order. */
+  predictedColumns?: string[];
+  /** Share (0-1) of predicted columns referenced by the final SQL. */
+  mappingHit?: number;
+  /** Milliseconds the Jev mapping took. */
+  mappingMs?: number;
+}
+
+/** A thumbs up or down on a response. Sent once; the UI locks after voting. */
+export interface FeedbackEvent {
+  type: "feedback";
+  responseId: string;
+  variant: Variant;
+  source: ResponseSource;
+  rating: "up" | "down";
+}
+
+/** Optional free-text comment after a thumbs down (at most MAX_COMMENT_CHARS). */
+export interface CommentEvent {
+  type: "comment";
+  responseId: string;
+  variant: Variant;
+  source: ResponseSource;
+  comment: string;
+}
+
+/** POST /api/event body. The endpoint answers 204 with no body. */
+export type TelemetryEvent = ResponseEvent | FeedbackEvent | CommentEvent;
+
+/** Per-variant aggregates shown on the results page. Rates are null when their denominator is 0. */
+export interface VariantStats {
+  responses: number;
+  ok: number;
+  up: number;
+  down: number;
+  comments: number;
+  /** up / (up + down). */
+  upRate: number | null;
+  /** Wilson 95% interval for upRate. */
+  upRateCi: [number, number] | null;
+  /** (up + down) / responses. */
+  feedbackRate: number | null;
+  /** ok / responses. */
+  okRate: number | null;
+  /** Median latency estimated from a bucketed histogram. */
+  medianLatencyMs: number | null;
+  meanAnswerMs: number | null;
+  /** Variant B: mean queries the loop ran. */
+  meanAttempts: number | null;
+  /** Variant B: mean predicted column count. */
+  meanPredictedK: number | null;
+  /** Variant B: mean share of predicted columns used by the final SQL. */
+  meanMappingHit: number | null;
+  /** Response counts keyed by ResponseOutcome. */
+  outcomes: Record<string, number>;
+}
+
+/** GET /api/results response (requires the `x-results-password` header). */
+export interface ResultsResponse {
+  /** False when no Redis store is configured; all numbers are then zero. */
+  configured: boolean;
+  generatedAt: string;
+  /** "model" counts only the model's responses to questions; "all" adds edited re-runs and history replays. */
+  scope: "model" | "all";
+  variants: Record<Variant, VariantStats>;
+  /** B's upRate minus A's, with a two-sided two-proportion z-test p-value; null until both have votes. */
+  upRateDiff: { diff: number; pValue: number } | null;
+  /** Most recent comments first, at most 50 (always across all sources). */
+  comments: { variant: Variant; source: ResponseSource; comment: string; at: string }[];
 }
