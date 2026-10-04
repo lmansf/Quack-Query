@@ -21,7 +21,15 @@ import {
   type StepResponse,
 } from "../shared/types.js";
 import { cleanSql, externalReference, isReadOnlySql } from "../shared/sql.js";
-import { buildLoopSystemPrompt, buildLoopUserMessage, hideDataNames, loopErrorText, parseStepReply } from "../shared/loop.js";
+import {
+  buildLoopSystemPrompt,
+  buildLoopUserMessage,
+  hideDataNames,
+  hideDataTypes,
+  loopErrorText,
+  parseStepReply,
+  shapeOnlyRefusal,
+} from "../shared/loop.js";
 import { ProviderError, type ProviderResult } from "./_providers/types.js";
 import { MAX_PROMPT_CHARS, MAX_STRING, finiteNumber, isRecord, validateQueryLike } from "./_providers/dataset.js";
 import { selectProvider } from "./_providers/select.js";
@@ -93,7 +101,7 @@ function validateAttempt(v: unknown, at: string, shapeOnly: boolean, dataset: Da
   if (present(v.types)) {
     const types = stringList(v.types, LOOP_MAX_COLUMNS);
     if (!types) return `${at}.types must be an array of at most ${LOOP_MAX_COLUMNS} strings of at most ${MAX_STRING} characters`;
-    attempt.types = types;
+    attempt.types = shapeOnly ? hideDataTypes(types, sql, dataset) : types;
   }
   if (present(v.rowCount)) {
     if (!finiteNumber(v.rowCount) || v.rowCount < 0) return `${at}.rowCount must be a number >= 0`;
@@ -115,7 +123,10 @@ function validateAttempt(v: unknown, at: string, shapeOnly: boolean, dataset: Da
     // Refusal reasons come from the checks, not from the data.
     attempt.error = outcome === "error" ? loopErrorText(v.error, shapeOnly) : v.error.slice(0, LOOP_ERROR_CHARS);
   }
-  return attempt;
+  // A PIVOT run in shape-only mode (by a client that let one through) is shown as refused,
+  // so nothing it produced, values in its column names included, reaches the model.
+  const pivot = shapeOnly ? shapeOnlyRefusal(sql) : null;
+  return pivot === null ? attempt : { sql, outcome: "refused", error: pivot };
 }
 
 function validate(body: unknown): StepRequest | string {
@@ -151,11 +162,15 @@ function usableReply(result: ProviderResult, remaining: number): ReturnType<type
   return parseStepReply(result.text, remaining);
 }
 
-/** Why the server will not let the browser run this SQL, or null when it passes the checks. */
-function refusalReason(sql: string): string | null {
+/**
+ * Why the server will not let the browser run this SQL, or null when it passes the
+ * checks. In shape-only mode an exploratory PIVOT is refused as well (shapeOnlyRefusal).
+ */
+function refusalReason(sql: string, exploratoryShapeOnly: boolean): string | null {
   if (!isReadOnlySql(sql)) return "the query is not a single read-only statement";
   const external = externalReference(sql);
-  return external === null ? null : `the query references ${external}, which is not allowed`;
+  if (external !== null) return `the query references ${external}, which is not allowed`;
+  return exploratoryShapeOnly ? shapeOnlyRefusal(sql) : null;
 }
 
 export async function POST(request: Request): Promise<Response> {
@@ -205,7 +220,7 @@ export async function POST(request: Request): Promise<Response> {
     const sql = cleanSql(reply.sql);
     if (sql.length === 0) return json(502, { error: "The model returned an empty query" });
     const body: StepResponse = { action: reply.action, sql, model: result.model };
-    const refused = refusalReason(sql);
+    const refused = refusalReason(sql, input.shapeOnly && reply.action === "query");
     if (refused !== null) body.refused = refused;
     return json(200, body);
   } catch (error) {

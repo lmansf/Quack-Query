@@ -8,7 +8,7 @@
  */
 import type { QueryResult } from "./duck";
 import { formatValue } from "./format";
-import { hideDataNames, loopErrorText } from "../shared/loop";
+import { hideDataNames, hideDataTypes, loopErrorText, shapeOnlyRefusal } from "../shared/loop";
 import { externalReference, isReadOnlySql } from "../shared/sql";
 import {
   LOOP_CELL_CHARS,
@@ -143,10 +143,12 @@ export async function runLoop(
       shapeOnly,
     });
     if (step.model) model = step.model;
-    const refusal = refusalReason(step);
     // A "query" with no budget left is treated as the final answer. A final query that
     // fails the checks is reported back like a refused query while budget remains.
     const final = step.action !== "query" || remaining <= 0;
+    // In shape-only mode an exploratory PIVOT is refused too (its result is never shown
+    // to the model when it is the final query, so a final PIVOT may run).
+    const refusal = refusalReason(step) ?? (shapeOnly && !final ? shapeOnlyRefusal(step.sql) : null);
     if (final && (refusal === null || remaining <= 0)) break;
     const index = attempts.length + 1;
     let ran: { attempt: LoopAttempt; result: QueryResult | null; rawError: string | null };
@@ -287,8 +289,9 @@ const clip = (text: string): string => text.slice(0, LOOP_CELL_CHARS);
  * What the model sees of a successful query: its shape (columns, DuckDB types,
  * row count; at most LOOP_MAX_COLUMNS columns) plus, unless `shapeOnly`, the
  * first LOOP_SAMPLE_ROWS rows as display strings. Every name and cell is cut
- * to LOOP_CELL_CHARS characters. In shape-only mode, column names that could
- * come from the data (see hideDataNames) are hidden when `dataset` is given.
+ * to LOOP_CELL_CHARS characters. In shape-only mode, column names and nested
+ * types that could come from the data (see hideDataNames, hideDataTypes) are
+ * hidden when `dataset` is given.
  */
 export function summarizeAttempt(
   sql: string,
@@ -298,11 +301,12 @@ export function summarizeAttempt(
 ): LoopAttempt {
   const width = Math.min(result.columns.length, LOOP_MAX_COLUMNS);
   const names = result.columns.slice(0, width).map(clip);
+  const types = result.types.slice(0, width).map(clip);
   const attempt: LoopAttempt = {
     sql,
     outcome: "ok",
     columns: shapeOnly && dataset ? hideDataNames(names, sql, dataset) : names,
-    types: result.types.slice(0, width).map(clip),
+    types: shapeOnly && dataset ? hideDataTypes(types, sql, dataset) : types,
     rowCount: result.rowCount,
   };
   if (!shapeOnly) {
@@ -357,7 +361,7 @@ const KEYWORD_WORDS = new Set([
  * each part of a qualified name on its own (`s.quantity` yields `s` and
  * `quantity`). Skipped: string literals, comments, aliases and cast targets
  * (`AS name`, `::TYPE`), function names (`sum(`), typed literals (`DATE '…'`),
- * and bare SQL keywords (KEYWORD_WORDS).
+ * and bare, unqualified SQL keywords (KEYWORD_WORDS).
  */
 function referencedIdentifiers(sql: string): Set<string> {
   const tokens = sqlTokens(sql);
@@ -370,7 +374,7 @@ function referencedIdentifiers(sql: string): Set<string> {
       return;
     }
     if (tok.kind === "word" && next && (next.text === "(" || next.kind === "string")) return;
-    if (tok.kind === "word" && KEYWORD_WORDS.has(tok.text.toLowerCase())) return;
+    if (tok.kind === "word" && prev?.text !== "." && KEYWORD_WORDS.has(tok.text.toLowerCase())) return;
     names.add(tok.text.toLowerCase());
   });
   return names;

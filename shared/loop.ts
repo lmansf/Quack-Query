@@ -87,10 +87,15 @@ export function describeLoopModelView(dataset: DatasetProfile): string {
 // Shape-only mode: keep values out of error text and column names
 // ---------------------------------------------------------------------------
 
-/** DuckDB error classes raised before any data is read: their messages name only query and schema objects. */
+/**
+ * DuckDB error classes raised while a query is parsed and bound: their messages name
+ * only query and schema objects. (PIVOT, the one construct that reads data while
+ * binding, is refused in shape-only mode; see shapeOnlyRefusal.)
+ */
 const COMPILE_ERROR_RE = /^(?:Parser|Binder|Catalog) Error:/;
 
-const TYPE_NAME = String.raw`[A-Z][A-Z0-9_]*(?:\([^'"…\n]*\))?`;
+/** A type name; digits in its parameters (DECIMAL(18,3)) are masked like any number. */
+const TYPE_NAME = String.raw`[A-Z][A-Z0-9_]*(?:\([^'"\n]*\))?`;
 const SOURCE_COLUMN = String.raw`(?: when casting from source column [^\s'"…]+)?`;
 
 /**
@@ -98,12 +103,14 @@ const SOURCE_COLUMN = String.raw`(?: when casting from source column [^\s'"…]+
  * are masked: in each, every place a data value can appear is a masked slot.
  */
 const MASKED_ERROR_TEMPLATES: RegExp[] = [
-  new RegExp(String.raw`^Conversion Error: Could not convert string '…' to ${TYPE_NAME}${SOURCE_COLUMN}$`),
+  new RegExp(String.raw`^Conversion Error: Could not convert string (?:'…'|"…") to ${TYPE_NAME}${SOURCE_COLUMN}$`),
   new RegExp(String.raw`^Conversion Error: invalid [a-z ]+ format: "…", expected format is \([^'"…]*\)${SOURCE_COLUMN}$`),
   new RegExp(
     String.raw`^Conversion Error: Type ${TYPE_NAME} with value (?:…|'…') can’t be cast ` +
       String.raw`(?:because the value is out of range for|to) the destination type ${TYPE_NAME}${SOURCE_COLUMN}$`,
   ),
+  new RegExp(String.raw`^Conversion Error: Could not cast value … to ${TYPE_NAME}${SOURCE_COLUMN}$`),
+  new RegExp(String.raw`^Conversion Error: Casting value (?:"…"|…) to type ${TYPE_NAME} failed: value is out of range!$`),
   /^Conversion Error: Date out of range: …(?:-…)*$/,
   new RegExp(String.raw`^Out of Range Error: Overflow in (?:addition|subtraction|multiplication|division) of ${TYPE_NAME} \(… [-+*/] …\)!?$`),
   /^Invalid Input Error: Could not parse string "…" according to format specifier "…"$/,
@@ -141,25 +148,84 @@ export function shapeOnlyError(message: string): string {
   return `${kind}: details hidden because result values are not shared with the model`;
 }
 
+/**
+ * Why a shape-only loop will not run this query, or null. PIVOT (and PIVOT_WIDER)
+ * without an IN list reads the data while the query is bound and turns values into
+ * column names, which would reach the model through column names, types, and binder
+ * errors. Matched on the raw text, so no comment or string trick can hide it; a
+ * string or identifier that is exactly "pivot" is refused too, which is harmless.
+ */
+export function shapeOnlyRefusal(sql: string): string | null {
+  return /\bpivot(?:_wider)?\b/i.test(sql)
+    ? "PIVOT is not available while result values are hidden, because it turns values into column names; use GROUP BY with conditional aggregates (e.g. sum(x) FILTER (WHERE ...)) instead"
+    : null;
+}
+
 /** Lower-cased words (letters, digits, underscores) of a name or statement. */
 function words(text: string): string[] {
   return text.toLowerCase().match(/[\p{L}\p{N}_]+/gu) ?? [];
 }
 
-/**
- * Result column names a shape-only loop may show the model. A name made only of
- * words that appear in the query itself or in the schema's table and column names is
- * kept (aliases, `sum("quantity")`, `count_star()`); any other name can only have come
- * from the data, as PIVOT turns values into column names, and becomes
- * "[hidden name n]". Idempotent.
- */
-export function hideDataNames(columns: string[], sql: string, dataset: DatasetProfile): string[] {
+/** Words of the query and of the schema's table and column names: what a shape-only result may name. */
+function knownWords(sql: string, dataset: DatasetProfile): Set<string> {
   const known = new Set(["count_star", ...words(sql)]);
   for (const table of dataset.tables) {
     for (const w of words(table.table)) known.add(w);
     for (const col of table.columns) for (const w of words(col.name)) known.add(w);
   }
-  return columns.map((name, i) => (words(name).every((w) => known.has(w)) ? name : `[hidden name ${i + 1}]`));
+  return known;
+}
+
+/** A name made only of known words (and at least one): anything else could have come from the data. */
+function knownName(name: string, known: Set<string>): boolean {
+  const ws = words(name);
+  return ws.length > 0 && ws.every((w) => known.has(w));
+}
+
+/**
+ * Result column names a shape-only loop may show the model. A name made only of
+ * words that appear in the query itself or in the schema's table and column names is
+ * kept (aliases, `sum("quantity")`, `count_star()`); any other name, including one with
+ * no letters or digits at all, could have come from the data and becomes
+ * "[hidden name n]". Idempotent.
+ */
+export function hideDataNames(columns: string[], sql: string, dataset: DatasetProfile): string[] {
+  const known = knownWords(sql, dataset);
+  return columns.map((name, i) => (knownName(name, known) ? name : `[hidden name ${i + 1}]`));
+}
+
+/** Words of DuckDB type names, which a result type holds besides field names. */
+const TYPE_WORDS = new Set([
+  "array", "bigint", "bit", "blob", "bool", "boolean", "date", "decimal", "double", "enum", "float", "hugeint",
+  "int", "integer", "interval", "json", "list", "map", "null", "numeric", "real", "smallint", "struct", "time",
+  "timestamp", "timestamp_ms", "timestamp_ns", "timestamp_s", "timestamptz", "tinyint", "ubigint", "uhugeint",
+  "uinteger", "union", "usmallint", "utinyint", "uuid", "varchar", "with", "zone",
+]);
+
+/**
+ * Field names of the STRUCT(...) parts of a type as src/duck.ts prints it: each
+ * name follows "STRUCT(" or a ", " and is bare or double-quoted (with "" escapes).
+ */
+const FIELD_NAME_RE = /(?:STRUCT\(|, )("(?:[^"]|"")*"|[^\s,()"]+) /g;
+
+/**
+ * Result types a shape-only loop may show the model. A type is kept when every
+ * STRUCT field name in it would pass as a column name (see hideDataNames) and the
+ * rest is only type words and numbers (DECIMAL(18,3), INTEGER[4]); otherwise it is
+ * cut to its outer name, as "STRUCT(…)". Idempotent.
+ */
+export function hideDataTypes(types: string[], sql: string, dataset: DatasetProfile): string[] {
+  const known = knownWords(sql, dataset);
+  return types.map((type) => {
+    let fieldsKnown = true;
+    const rest = type.replace(FIELD_NAME_RE, (match: string, name: string) => {
+      const plain = name.startsWith('"') ? name.slice(1, -1).replace(/""/g, '"') : name;
+      if (!knownName(plain, known)) fieldsKnown = false;
+      return match.startsWith(",") ? ", " : "STRUCT( ";
+    });
+    const restKnown = !rest.includes('"') && words(rest).every((w) => TYPE_WORDS.has(w) || /^\d+$/.test(w));
+    return fieldsKnown && restKnown ? type : `${/^[A-Za-z_]+/.exec(type)?.[0] ?? "UNKNOWN"}(…)`;
+  });
 }
 
 /** An error message as the loop passes it on: values masked in shape-only mode, at most LOOP_ERROR_CHARS. */
@@ -222,7 +288,8 @@ export function buildLoopUserMessage(req: StepRequest): string {
   if (req.shapeOnly) {
     lines.push(
       "Result values are hidden at the user's request: only the shape of each result (row count, columns, and types) " +
-        "and any error are shown, with values masked as … and column names that could come from the data hidden.",
+        "and any error are shown, with values masked as … and column names that could come from the data hidden. " +
+        "PIVOT is not available in this mode.",
     );
   }
   if (req.attempts.length === 0) lines.push("(none yet)");

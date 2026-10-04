@@ -11,6 +11,7 @@
 import {
   APIConnectionError,
   APIError,
+  APITimeoutError,
   APIUserAbortError,
   AuthenticationError,
   RateLimitError,
@@ -274,10 +275,11 @@ function unexpected(what: string): ProviderError {
   return new ProviderError(502, `Jev returned an unexpected response: ${what}`);
 }
 
-/** One named answer of a System One result (the SDK returns the parsed JSON unchecked). */
-function answerOf(result: unknown, name: string): unknown {
+/** The model id and one named answer of a System One result (the SDK returns the parsed JSON unchecked). */
+function readResult(result: unknown, name: string): { model: string | null; answer: unknown } {
   if (!isRecord(result) || !isRecord(result.answers)) throw unexpected("no answers");
-  return result.answers[name];
+  const model = typeof result.model === "string" && result.model.length > 0 ? result.model : null;
+  return { model, answer: result.answers[name] };
 }
 
 /** Probabilities in rubric order (missing levels count as 0) and the expected score. */
@@ -350,6 +352,7 @@ function toProviderError(error: unknown, deadline: AbortSignal): unknown {
     const detail = error.message.replace(/^\d{3}\s*/, "").trim().slice(0, 300) || "no details";
     return new ProviderError(502, `Jev error (${error.status}): ${detail}`);
   }
+  if (error instanceof APITimeoutError) return new ProviderError(504, `Jev did not answer in time: ${error.message}`);
   if (error instanceof APIConnectionError) return new ProviderError(502, `Could not reach Jev: ${error.message}`);
   if (error instanceof TypeSafeError) return new ProviderError(500, `Jev client error: ${error.message}`);
   return error;
@@ -416,8 +419,9 @@ export async function predictMapping(dataset: DatasetProfile, question: string):
       { signal: deadline },
     );
     let calls = 1;
-    let model = typeof counted.model === "string" && counted.model.length > 0 ? counted.model : client.defaultModel;
-    const count = readCount(answerOf(counted, "count"));
+    const countResult = readResult(counted, "count");
+    let model = countResult.model ?? client.defaultModel;
+    const count = readCount(countResult.answer);
     const k = Math.max(1, Math.min(argmax(count.probabilities) + 1, candidates.length));
 
     const chosen: Candidate[] = [];
@@ -444,8 +448,9 @@ export async function predictMapping(dataset: DatasetProfile, question: string):
           { signal: deadline },
         );
         calls++;
-        if (typeof result.model === "string" && result.model.length > 0) model = result.model;
-        ({ pick, probability } = readChoice(answerOf(result, "column"), offered));
+        const slotResult = readResult(result, "column");
+        if (slotResult.model !== null) model = slotResult.model;
+        ({ pick, probability } = readChoice(slotResult.answer, offered));
       }
       chosen.push(pick);
       picked.add(pick.index);
