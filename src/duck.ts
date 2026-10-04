@@ -15,6 +15,7 @@ import { LOW_CARDINALITY_LIMIT, MAX_OVERLAP_PAIRS, MIN_OVERLAP_FRACTION } from '
 import type { ColumnProfile, DatasetProfile, RelationshipHint, TableProfile } from '../shared/types';
 import { formatValue } from './format';
 import { xlsxToSheets } from './xlsx';
+import { isSelfContained, trimStatement } from '../shared/sql';
 
 export { isReadOnlySql } from '../shared/sql';
 export { formatValue };
@@ -971,13 +972,14 @@ let exportCounter = 0;
  *   as empty fields, dates as `YYYY-MM-DD`.
  * - `parquet`: a standard Parquet file (default DuckDB compression).
  *
- * A single trailing `;` on the user SQL is stripped, since a `COPY` subquery
- * cannot end with one. Any DuckDB error propagates to the caller.
+ * The statement goes in as a subquery (see `subqueryText`), so like the
+ * preview this wrapper refuses DML and multiple statements. Any DuckDB error
+ * propagates to the caller.
  */
 export async function exportQuery(sql: string, format: ExportFormat): Promise<Uint8Array> {
+  const inner = subqueryText(sql);
   const db = await getDb();
   const conn = await getConn();
-  const inner = subqueryText(sql);
   const name = `${UPLOAD_PREFIX}export_${Date.now()}_${exportCounter++}.${format}`;
   const options = format === 'csv' ? 'FORMAT CSV, HEADER true' : 'FORMAT PARQUET';
   const missing = extensionErrors.get(format);
@@ -986,26 +988,40 @@ export async function exportQuery(sql: string, format: ExportFormat): Promise<Ui
     // Pre-register the target as an in-memory buffer file (DuckDB-Wasm's documented
     // COPY-to-buffer pattern); the COPY below then writes into the virtual FS.
     await db.registerEmptyFileBuffer(name);
-    await queryWithTimeout(conn, `COPY (${inner}) TO ${quoteLiteral(name)} (${options})`, EXPORT_TIMEOUT_MS);
+    await queryWithTimeout(conn, `COPY (\n${inner}\n) TO ${quoteLiteral(name)} (${options})`, EXPORT_TIMEOUT_MS);
     return await db.copyFileToBuffer(name);
   } finally {
     await db.dropFile(name).catch(() => null);
   }
 }
 
-/** Trims a statement and strips a single trailing `;` so it can be used as a subquery. */
+/**
+ * The statement as the body of a wrapper (`SELECT ... FROM (<body>)`,
+ * `COPY (<body>) TO`), which puts it on lines of its own so that a trailing
+ * `-- comment` cannot swallow the closing parenthesis. Surrounding whitespace
+ * and trailing semicolons and comments are trimmed (a subquery cannot end with
+ * a `;`). Throws unless the statement closes every quote, comment and
+ * parenthesis it opens: a stray `)` would end the wrapper early, and whatever
+ * followed it would run as more statements.
+ */
 function subqueryText(sql: string): string {
-  return sql.trim().replace(/;$/, '');
+  const inner = trimStatement(sql);
+  if (!isSelfContained(inner)) {
+    throw new Error('The query has unbalanced parentheses or an unclosed quote or comment.');
+  }
+  return inner;
 }
 
 /**
  * Exact number of rows a read-only statement produces, computed inside DuckDB
  * (`SELECT count(*) FROM (<sql>)`) so the result is never materialized here.
- * Throws for statements DuckDB will not accept as a subquery (SHOW, PRAGMA...).
+ * Throws for anything DuckDB will not accept as a subquery: DML, several
+ * statements, PRAGMA and the like. That makes this wrapper a guard too.
  */
 export async function countQuery(sql: string): Promise<number> {
+  const inner = subqueryText(sql);
   const conn = await getConn();
-  const res = await queryWithTimeout(conn, `SELECT count(*) AS n FROM (${subqueryText(sql)}) AS q`, QUERY_TIMEOUT_MS);
+  const res = await queryWithTimeout(conn, `SELECT count(*) AS n FROM (\n${inner}\n) AS q`, QUERY_TIMEOUT_MS);
   return Number(res.getChildAt(0)?.get(0) ?? 0);
 }
 
@@ -1013,8 +1029,12 @@ export async function countQuery(sql: string): Promise<number> {
  * Like `runQuery`, but fetches only the first `maxRows` rows (`... LIMIT maxRows + 1`)
  * and gets the exact `rowCount` from a separate `countQuery`, so large results
  * never have to be materialized in the browser. Pass `knownRowCount` (from an
- * earlier `countQuery(sql)`) to skip the count. Statements DuckDB rejects as a
- * subquery (SHOW, DESCRIBE, PRAGMA...) fall back to a plain `runQuery`.
+ * earlier `countQuery(sql)`) to skip the count.
+ *
+ * The statement only ever runs wrapped as a subquery, never as raw text, which
+ * makes the wrapper a second guard after `isReadOnlySql`: DuckDB refuses DML
+ * and multiple statements inside a subquery, so such SQL fails with a parser
+ * error instead of running. Every error propagates to the caller.
  */
 export async function runQueryPreview(
   sql: string,
@@ -1022,14 +1042,8 @@ export async function runQueryPreview(
   knownRowCount?: number,
 ): Promise<QueryResult> {
   const inner = subqueryText(sql);
-  let preview: QueryResult;
-  let rowCount: number;
-  try {
-    preview = await runQuery(`SELECT * FROM (${inner}) AS q LIMIT ${maxRows + 1}`, maxRows + 1);
-    rowCount = knownRowCount ?? (await countQuery(inner));
-  } catch {
-    return runQuery(sql, maxRows);
-  }
+  const preview = await runQuery(`SELECT * FROM (\n${inner}\n) AS q LIMIT ${maxRows + 1}`, maxRows + 1);
+  const rowCount = knownRowCount ?? (await countQuery(inner));
   return {
     columns: preview.columns,
     types: preview.types,
